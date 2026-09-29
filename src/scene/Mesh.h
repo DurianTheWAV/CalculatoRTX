@@ -42,6 +42,10 @@ struct RoundedBoxDesc {
 
 void addRoundedBox(Mesh& mesh, const RoundedBoxDesc& d);
 
+// Retourne un maillage (normales et sens des triangles) : sert à la paroi intérieure d'un
+// volume creux, dont la normale "extérieure" pointe vers la cavité.
+void invertMesh(Mesh& mesh);
+
 // Hauteur de la face supérieure d'un RoundedBox en (x, z) locaux (pour poser du texte dessus).
 float roundedBoxTopHeight(const RoundedBoxDesc& d, float x, float z);
 

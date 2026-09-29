@@ -1,7 +1,8 @@
 # CalculatoRTX
 
 Calculatrice scientifique **entièrement ray tracée** en CUDA C++ : chaque pixel de l'interface
-(châssis, touches, légendes en relief, chiffres de l'afficheur, vitre, bureau, arrière-plan)
+(coque translucide et électronique visible au travers, touches, légendes en relief, chiffres de
+l'afficheur, vitre, bureau, arrière-plan)
 est calculé par **path tracing OptiX sur les RT cores**, suréchantillonné par **NVIDIA DLSS**
 (Tensor cores), et **tous les calculs mathématiques sont exécutés sur la carte graphique**.
 
@@ -14,12 +15,12 @@ Compatible **Linux** (CachyOS/Arch, Ubuntu…) et **Windows 10/11**.
 > développement). La section [Dépannage](#dépannage) décrit les points à vérifier au premier
 > lancement.
 
-![Aperçu de la géométrie](docs/apercu-geometrie.png)
+![Rendu de référence](docs/apercu-rendu.jpg)
 
-*Aperçu de contrôle de la géométrie de la scène (rastérisation CPU simplifiée, **sans** ray
-tracing), utilisé pour valider la mise en page. Dans l'application, l'image est produite par
-path tracing : ombres douces, reflets, réfraction de la vitre, éclairage global, lueur de
-l'afficheur…*
+*Image de référence calculée **sur CPU** pendant le développement par un portage du path tracer
+de `Programs.cu` (mêmes matériaux, même scène, 320 échantillons par pixel, sans DLSS ni
+débruiteur). Ce n'est pas une capture de l'application : sur la RTX 4070 Ti, la même image est
+produite en temps réel par OptiX, puis débruitée et suréchantillonnée par le DLSS.*
 
 ---
 
@@ -40,21 +41,26 @@ l'afficheur…*
 
 ### Interface 100 % ray tracée
 
-Il n'y a aucun élément 2D : l'interface est une scène 3D (~87 000 triangles, 101 instances).
+Il n'y a aucun élément 2D : l'interface est une scène 3D (~105 000 triangles, 118 instances).
 
 | Élément | Ce que calculent les rayons |
 |---|---|
-| Châssis en titane brossé, lit de touches en carbone | réflexions GGX, ombres douces, éclairage global |
+| Pourtour de la coque (flancs, rebords, bandeau du logo) en polycarbonate gris translucide, creux | double réfraction à travers la paroi dépolie (microfacettes GGX), absorption de Beer-Lambert dans l'épaisseur, diffusion laiteuse qui garde la teinte grise |
+| Électronique interne : circuit imprimé (pistes et vias procéduraux), dômes de contact, processeur, quartz, mémoire, composants CMS, condensateurs, nappe Kapton, pile, LED témoin | vue en transparence, légèrement estompée ; éclairée par la lumière qui traverse la coque, ombres comprises |
+| Lit de touches en carbone, cadre de l'afficheur | plaques opaques enchâssées dans la coque : réflexions GGX, ombres douces, éclairage global |
+| Calculatrice inclinée de 15° sur une béquille en aluminium brossé et deux patins | l'écran fait face à l'utilisateur ; toute la scène est posée dans un repère incliné |
 | 40 touches arrondies à face concave | géométrie instanciée, vernis (clear-coat), animation d'appui |
 | Légendes des touches, texte de l'afficheur | **vrais volumes 3D** extrudés à partir d'une police vectorielle (pas de texture) |
 | Afficheur fluorescent (VFD) | chiffres émissifs qui éclairent la scène, sous une **vitre réfractive** (Fresnel exact) |
 | Grille perforée + bande lumineuse verte | trous hexagonaux via **Opacity Micromaps** + programme any-hit |
-| Cellule solaire, marquage, bureau en noyer verni | matériaux procéduraux évalués dans le shader |
+| Cellule solaire (étroite, à droite), marquage, bureau en noyer verni | matériaux procéduraux évalués dans le shader |
 | Arrière-plan « studio » | environnement HDR généré sur GPU, échantillonné par les unités de texture |
 | Luminaires (softbox, contre-jour, appoint) | géométrie émissive + échantillonnage direct avec MIS |
 | Survol / clic | **sélection par lancer de rayon** sous le curseur |
 
-Le rendu fait jusqu'à 5 rebonds (réglable), avec roulette russe, et fournit au DLSS la
+Le rendu fait jusqu'à 5 rebonds (réglable), sans compter les traversées de verre et de
+plastique (8 au plus en plus, pour que l'électronique vue à travers la coque reste éclairée),
+avec roulette russe, et fournit au DLSS la
 profondeur et les vecteurs de mouvement (y compris ceux des touches qui s'enfoncent).
 
 ### Calculs sur le GPU
@@ -294,13 +300,13 @@ src/calc/DoubleDouble.cuh           arithmétique double-double (exp, log, trigo
 src/calc/CalcCore.cuh               analyseur, 4 arithmétiques, formatage décimal (GPU + tests CPU)
 src/calc/CalcEngine.cu              kernel warp + interface hôte
 src/render/device/Programs.cu       programmes OptiX : raygen (path tracer SER), pick, any-hit
-src/render/device/Shading.cuh       BSDF (Lambert + GGX + vernis), Fresnel, motifs procéduraux
+src/render/device/Shading.cuh       BSDF (Lambert + GGX + vernis), diélectrique dépoli, Fresnel, motifs procéduraux
 src/render/OptixRenderer.*          pipeline, SBT, GAS/IAS, OMM, débruiteur IA, cache L2
 src/render/Kernels.*                environnement HDR, conversion FP16, post-traitement (CUDA Graph)
 src/render/Grille.h                 fonction de distance des trous (OMM + any-hit)
 src/scene/StrokeFont.*              police vectorielle (glyphes en traits)
 src/scene/Mesh.*                    maillages procéduraux : pavés arrondis, texte extrudé, grilles
-src/scene/CalculatorScene.*         calculatrice complète : touches, afficheur, matériaux, lumières
+src/scene/CalculatorScene.*         calculatrice complète : coque, électronique, béquille, touches, afficheur, matériaux, lumières
 src/gpu/VulkanContext.*             instance, périphérique, swapchain, mémoire/sémaphores exportés
 src/dlss/DlssUpscaler.*             intégration NGX DLSS (repli automatique si indisponible)
 tests/CalcHostTest.cu               tests du moteur de calcul exécutés sur CPU

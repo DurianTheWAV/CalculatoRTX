@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace crtx {
 
@@ -106,6 +107,12 @@ void addRoundedBox(Mesh& mesh, const RoundedBoxDesc& d)
             pushTriangle(mesh, a0 + i, b0 + i1, b0 + i);
         }
     }
+}
+
+void invertMesh(Mesh& mesh)
+{
+    for (float3& n : mesh.normals) n = n * -1.0f;
+    for (uint3& t : mesh.indices) std::swap(t.y, t.z);
 }
 
 float roundedBoxTopHeight(const RoundedBoxDesc& d, float x, float z)

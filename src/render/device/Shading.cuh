@@ -79,6 +79,7 @@ struct Surface {
     float specular;
 };
 
+// P : position dans le repère de l'objet (les motifs suivent l'objet s'il est incliné ou animé)
 __device__ Surface evalMaterial(const Material& m, float3 P, float2 uv)
 {
     Surface s;
@@ -146,6 +147,34 @@ __device__ Surface evalMaterial(const Material& m, float3 P, float2 uv)
             const float sheen = 0.55f + 0.9f * sinf(t * kPi);
             s.base = s.base * sheen;
             s.roughness = m.roughness * (warp ? 0.8f : 1.25f);
+            break;
+        }
+        case kPatternPcb: {
+            // Vernis épargne vert ; pistes de cuivre visibles en plus clair sous le vernis,
+            // routées par zones de 1.3 cm orientées en X ou en Z ; vias étamés.
+            const float rx = floorf(P.x / 1.3f), rz = floorf(P.z / 1.3f);
+            const bool alongX = hash3i(static_cast<int>(rx), static_cast<int>(rz), 3) < 0.5f;
+            const float along = alongX ? P.x : P.z, across = alongX ? P.z : P.x;
+            const float lane = floorf(across / 0.1f), fl = fractf(across / 0.1f);
+            const float laneSeed = hash3i(static_cast<int>(lane), 5, static_cast<int>(alongX ? rz : rx));
+            const float seg = floorf(along / 0.7f + laneSeed);
+            const float hs = hash3i(static_cast<int>(lane), static_cast<int>(seg), static_cast<int>(rx * 7.0f + rz * 13.0f));
+            if (hs < 0.55f && fabsf(fl - 0.5f) < 0.2f) s.base = s.base * 2.3f + make_float3(0.01f, 0.03f, 0.0f);
+            const float vx = P.x / 0.45f, vz = P.z / 0.45f;
+            const float hv = hash3i(static_cast<int>(floorf(vx)), static_cast<int>(floorf(vz)), 9);
+            const float dx = fractf(vx) - 0.5f, dz = fractf(vz) - 0.5f;
+            const float r = sqrtf(dx * dx + dz * dz) * 0.45f;
+            if (hv < 0.18f && r < 0.04f) {
+                if (r < 0.017f) {
+                    s.base = make_float3(0.01f, 0.01f, 0.01f);
+                    s.roughness = 0.8f;
+                } else {
+                    s.base = make_float3(0.78f, 0.78f, 0.8f);
+                    s.metallic = 1.0f;
+                    s.roughness = 0.3f;
+                }
+                s.clearcoat = 0.0f;
+            }
             break;
         }
         default:
@@ -296,6 +325,51 @@ __device__ float fresnelDielectric(float cosi, float eta)
     const float rs = (eta * cosi - cost) / (eta * cosi + cost);
     const float rp = (cosi - eta * cost) / (cosi + eta * cost);
     return 0.5f * (rs * rs + rp * rp);
+}
+
+// Transmittance de Beer-Lambert : couleur atteinte après 'ratio' fois la distance de référence
+__device__ __forceinline__ float3 beerLambert(float3 colorAtDistance, float ratio)
+{
+    return make_float3(powf(fmaxf(colorAtDistance.x, 1e-4f), ratio), powf(fmaxf(colorAtDistance.y, 1e-4f), ratio),
+                       powf(fmaxf(colorAtDistance.z, 1e-4f), ratio));
+}
+
+// Interface diélectrique lisse (roughness = 0) ou dépolie : microfacettes GGX (Walter et al.
+// 2007) avec échantillonnage des normales visibles, puis réflexion ou réfraction choisie
+// selon Fresnel. nOut : normale extérieure du volume (le sens d'entrée / sortie en découle).
+// Retourne false si le chemin s'éteint (direction sous la surface).
+__device__ bool sampleDielectric(float3 rd, float3 nOut, float ior, float roughness, Rng& rng, float3& nd,
+                                 float& weight, bool& refracted)
+{
+    const bool entering = dot(rd, nOut) < 0.0f;
+    const float3 n = entering ? nOut : nOut * -1.0f;  // normale côté incident
+    const float eta = entering ? 1.0f / ior : ior;
+    float3 m = n;
+    float a2 = 0.0f;
+    const float2 u2 = rng.next2();
+    if (roughness > 0.02f) {
+        const float a = fmaxf(roughness * roughness, 1e-3f);
+        a2 = a * a;
+        const Onb onb = makeOnb(n);
+        float3 wo = toLocal(onb, rd * -1.0f);
+        wo.z = fmaxf(wo.z, 1e-4f);
+        m = toWorld(onb, sampleVndf(normalize(wo), a, u2));
+    }
+    const float cosi = dot(rd * -1.0f, m);
+    if (cosi <= 0.0f) return false;
+    const float F = fresnelDielectric(fminf(cosi, 1.0f), eta);
+    refracted = rng.next() >= F;
+    if (!refracted) {
+        nd = reflect(rd, m);
+        if (dot(nd, n) <= 0.0f) return false;
+    } else {
+        const float k = 1.0f - eta * eta * (1.0f - cosi * cosi);
+        nd = normalize(rd * eta + m * (eta * cosi - sqrtf(fmaxf(k, 0.0f))));
+        if (dot(nd, n) >= 0.0f) return false;
+    }
+    // poids VNDF : terme d'ombrage de Smith de la direction sortante
+    weight = a2 > 0.0f ? smithG1(fabsf(dot(nd, n)), a2) : 1.0f;
+    return true;
 }
 
 }  // namespace dev

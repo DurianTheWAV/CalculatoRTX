@@ -1,8 +1,12 @@
 // CalculatoRTX - description 3D complète de la calculatrice (géométrie, matériaux, lumières).
 //
 // Tout ce qui est visible à l'écran est de la géométrie triangulaire traversée par les
-// rayons : châssis, touches, légendes en relief, chiffres de l'afficheur, vitre, grille
-// perforée, cellule solaire, bureau et luminaires. Il n'y a aucun élément 2D.
+// rayons : pourtour de la coque en plastique gris translucide et l'électronique qu'il laisse deviner,
+// touches, légendes en relief, chiffres de l'afficheur, vitre, grille perforée, cellule
+// solaire, béquille, bureau et luminaires. Il n'y a aucun élément 2D.
+//
+// La calculatrice est construite dans son propre repère (face inférieure en y = 0, avant
+// vers +z) puis inclinée sur sa béquille par la transformation calcToWorld().
 #pragma once
 
 #include "../render/LaunchParams.h"
@@ -16,8 +20,11 @@
 namespace crtx {
 
 enum MaterialId : int {
-    kMatDesk, kMatChassis, kMatKeybed, kMatBezel, kMatVfdPanel, kMatGlass, kMatGlow, kMatGrille,
+    kMatDesk, kMatShell, kMatKeybed, kMatBezel, kMatVfdPanel, kMatGlass, kMatGlow, kMatGrille,
     kMatGrilleFrame, kMatSolar, kMatBrand, kMatBrandGreen,
+    // électronique interne et support
+    kMatPcb, kMatSteel, kMatTin, kMatBrass, kMatChip, kMatDie, kMatCeramic, kMatCapSleeve, kMatAluminium,
+    kMatKapton, kMatFerrite, kMatLed, kMatRubber, kMatStand,
     kMatKeyLight, kMatKeyDark, kMatKeyOrange, kMatKeyGreen, kMatKeyRed, kMatKeyYellow,
     kMatLegendDark, kMatLegendLight, kMatLegendWhite,
     kMatVfdBright, kMatVfdDim, kMatVfdError, kMatVfdStatus,
@@ -85,13 +92,19 @@ public:
     const std::vector<Material>& materials() const { return materials_; }
     const std::vector<RectLight>& lights() const { return lights_; }
 
-    float3 focusPoint() const { return make_float3(0.0f, 1.2f, 0.75f); }
+    // Point visé par la caméra orbitale (centre de la face avant inclinée)
+    float3 focusPoint() const { return focus_; }
+    const Affine& calcToWorld() const { return calcXf_; }
 
 private:
     int addMesh(Mesh&& m, bool alpha = false);
     int addInstance(const SceneInstance& inst);
+    // Pièce de la calculatrice : maillage en repère calculatrice, instance inclinée (calcXf_)
+    int addPart(Mesh&& m, int material, unsigned mask = kMaskSolid, bool alpha = false);
     void buildMaterials();
     void buildBody();
+    void buildInternals();
+    void buildStand();
     void buildKeys();
     void buildLights();
     void rebuildLegend(int key);
@@ -103,6 +116,8 @@ private:
     std::vector<Material> materials_;
     std::vector<RectLight> lights_;
     std::vector<KeyDef> keys_;
+    Affine calcXf_ = affineIdentity();  // repère calculatrice -> monde (inclinaison)
+    float3 focus_ = make_float3(0, 0, 0);
 
     struct KeyRuntime {
         int capInstance = -1;

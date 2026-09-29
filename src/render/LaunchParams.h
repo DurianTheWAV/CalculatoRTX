@@ -23,6 +23,7 @@ enum Pattern : int {
     kPatternGrille = 4,    // grille perforée (trous hexagonaux, OMM + any-hit)
     kPatternVfd = 5,       // fond d'afficheur fluorescent (trame fine)
     kPatternCarbon = 6,    // fibre de carbone (lit des touches)
+    kPatternPcb = 7,       // circuit imprimé : vernis épargne, pistes, vias
 };
 
 struct Material {
@@ -30,14 +31,22 @@ struct Material {
     float roughness;
     float3 emission;
     float metallic;
-    float transmission;  // 1 = diélectrique transparent (verre)
+    float transmission;  // 1 = diélectrique transparent (verre, coque translucide)
     float ior;
     float clearcoat;
     float clearcoatRoughness;
     float specular;  // réflectance spéculaire des diélectriques (0.5 => F0 = 4 %)
     int pattern;
     float patternScale;
-    float pad0;
+    // Absorption volumique (loi de Beer-Lambert) des diélectriques : la lumière qui a
+    // parcouru absorbDistance dans la matière est teintée par absorbColor (0 = aucune).
+    float absorbDistance;
+    float3 absorbColor;
+    // Plastique translucide : fraction 'haze' de la lumière qui entre dans la matière est
+    // rediffusée vers l'extérieur avec l'albédo hazeColor (diffusion volumique approchée).
+    float haze;
+    float3 hazeColor;
+    float emitUpOnly;  // 1 = n'émet que vers le haut (+Y objet) : impression lumineuse sur plastique transparent
 };
 
 struct GeometryData {
