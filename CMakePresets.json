@@ -1,0 +1,42 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "linux-release",
+            "displayName": "Linux (CachyOS/Arch/Ubuntu) - Release",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/linux-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_CUDA_ARCHITECTURES": "89"
+            },
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+        },
+        {
+            "name": "linux-debug",
+            "inherits": "linux-release",
+            "displayName": "Linux - Debug",
+            "binaryDir": "${sourceDir}/build/linux-debug",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "windows-release",
+            "displayName": "Windows (Visual Studio 2022) - Release",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build/windows",
+            "cacheVariables": { "CMAKE_CUDA_ARCHITECTURES": "89" },
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        }
+    ],
+    "buildPresets": [
+        { "name": "linux-release", "configurePreset": "linux-release" },
+        { "name": "linux-debug", "configurePreset": "linux-debug" },
+        { "name": "windows-release", "configurePreset": "windows-release", "configuration": "Release" }
+    ],
+    "testPresets": [
+        { "name": "linux-release", "configurePreset": "linux-release", "output": { "outputOnFailure": true } },
+        { "name": "windows-release", "configurePreset": "windows-release", "configuration": "Release", "output": { "outputOnFailure": true } }
+    ]
+}
