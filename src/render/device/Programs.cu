@@ -7,7 +7,8 @@
 //     avant le shading - accéléré par le matériel sur Ada Lovelace (RTX 40),
 //   * Opacity Micromaps + any-hit pour la grille perforée,
 //   * éclairage direct par échantillonnage des luminaires + MIS, ombres douces,
-//     réflexions GGX, réfraction du verre de l'afficheur, illumination globale,
+//     réflexions GGX, réfraction du verre de l'afficheur et de la coque translucide dépolie
+//     (absorption de Beer-Lambert, diffusion), illumination globale,
 //   * sorties auxiliaires pour DLSS (profondeur, vecteurs de mouvement) et pour le
 //     débruiteur IA OptiX (albédo, normales).
 #include <optix.h>
@@ -31,6 +32,7 @@ struct Hit {
     float3 N;        // normale d'ombrage orientée vers le rayon incident
     float3 Ng;       // normale géométrique orientée vers le rayon incident
     float3 Nout;     // normale "extérieure" du maillage (verre : entrée / sortie)
+    float3 dirObj;   // direction du rayon dans le repère de l'objet
     float2 uv;
     float t;
     int instance;
@@ -95,6 +97,7 @@ __device__ Hit fetchHit(float3 rayDir)
     optixHitObjectGetObjectToWorldTransformMatrix(o2w);
     optixHitObjectGetWorldToObjectTransformMatrix(w2o);
     h.P = xformPoint(o2w, h.Pobj);
+    h.dirObj = xformVector(w2o, rayDir);
 
     float3 ng = normalize(transformNormalW2OT(w2o, cross(p1 - p0, p2 - p0)));
     float3 ns = ng;
@@ -168,7 +171,12 @@ __device__ PathOutput tracePath(float2 pix, Rng& rng, bool firstSample)
     const bool useSer = (params.flags & kFlagSER) != 0;
     const bool clampFire = (params.flags & kFlagFireflyClamp) != 0;
 
-    for (unsigned bounce = 0; bounce <= params.maxBounces; ++bounce) {
+    // 'bounce' compte tous les impacts ; 'scatter' seulement les rebonds sur des surfaces
+    // non transparentes (limités par maxBounces). Les traversées de verre ont leur propre
+    // plafond, pour qu'un objet vu à travers la coque reste éclairé.
+    constexpr unsigned kMaxGlassEvents = 8;
+    unsigned scatter = 0;
+    for (unsigned bounce = 0; bounce <= params.maxBounces + kMaxGlassEvents; ++bounce) {
         optixTraverse(params.handle, ro, rd, 0.0f, 1e16f, 0.0f, kMaskAll, OPTIX_RAY_FLAG_NONE, 0, 1, 0);
 
         // ---- Shader Execution Reordering : cohérence par matériau
@@ -200,8 +208,8 @@ __device__ PathOutput tracePath(float2 pix, Rng& rng, bool firstSample)
         const Hit h = fetchHit(rd);
         const InstanceData& inst = params.instances[h.instance];
         const Material& m = params.materials[inst.material];
-        Surface s = evalMaterial(m, h.P, h.uv);
-        const bool isGlass = s.transmission > 0.5f;
+        Surface s = evalMaterial(m, h.Pobj, h.uv);
+        bool isGlass = s.transmission > 0.5f;
 
         if (bounce == 0 && firstSample) {
             out.depth = deviceDepth(cam, h.P);
@@ -209,14 +217,16 @@ __device__ PathOutput tracePath(float2 pix, Rng& rng, bool firstSample)
             const float3 prevP = xformPoint(inst.prevObjectToWorld, h.Pobj);
             if (projectToPixel(params.prevCam, prevP, size, prev)) out.motion = prev - pix;
         }
-        if (!guideDone && (!isGlass || bounce >= 3)) {
-            out.albedo = fminf3(s.base + s.emission, make_float3(1, 1, 1));
+        if (!guideDone && (!isGlass || bounce >= 3 || m.haze > 0.0f)) {
+            const float3 a = (isGlass && m.haze > 0.0f) ? m.hazeColor : s.base;  // guide stable (non aléatoire)
+            out.albedo = fminf3(a + s.emission, make_float3(1, 1, 1));
             out.normal = h.N;
             guideDone = true;
         }
 
         // ---- émission (surbrillance des touches incluse)
         float3 Le = s.emission * (1.0f + 1.5f * inst.glow) + inst.glowColor * (inst.glow * 0.5f);
+        if (m.emitUpOnly > 0.5f && h.dirObj.y > 0.0f) Le = make_float3(0, 0, 0);  // vu par en dessous
         if (inst.lightIndex >= 0) {
             const RectLight& L = params.lights[inst.lightIndex];
             const float cosL = -dot(rd, L.normal);
@@ -232,29 +242,35 @@ __device__ PathOutput tracePath(float2 pix, Rng& rng, bool firstSample)
             if (clampFire && bounce > 0) c = clampLum(c, 30.0f);
             out.radiance += c;
         }
-        if (bounce == params.maxBounces) break;
+        if (scatter == params.maxBounces) break;
         if (inst.lightIndex >= 0) break;  // les luminaires n'ont pas de réflexion
 
-        // ---- verre lisse : réflexion / réfraction de Fresnel (lobe de Dirac)
+        // ---- plastique translucide : une partie de la lumière qui entre dans la matière est
+        //      rediffusée ; ce rebond devient alors un rebond diffus ordinaire (NEE comprise)
+        if (isGlass && m.haze > 0.0f && dot(rd, h.Nout) < 0.0f && rng.next() < m.haze) {
+            isGlass = false;
+            s.base = m.hazeColor;
+            s.transmission = 0.0f;
+            s.metallic = 0.0f;
+        }
+
+        // ---- verre / plastique transparent : réflexion ou réfraction de Fresnel, interface
+        //      lisse (vitre) ou dépolie (coque), absorption dans l'épaisseur traversée
         if (isGlass) {
-            const bool entering = dot(rd, h.Nout) < 0.0f;
-            const float3 n = entering ? h.Nout : h.Nout * -1.0f;
-            const float eta = entering ? 1.0f / s.ior : s.ior;
-            const float cosi = fminf(1.0f, -dot(rd, n));
-            const float F = fresnelDielectric(cosi, eta);
+            if (m.absorbDistance > 0.0f && dot(rd, h.Nout) > 0.0f)  // sortie : le segment était dans la matière
+                throughput *= beerLambert(m.absorbColor, h.t / m.absorbDistance);
             float3 nd;
-            if (rng.next() < F) {
-                nd = reflect(rd, n);
-            } else {
-                const float k = 1.0f - eta * eta * (1.0f - cosi * cosi);
-                nd = normalize(rd * eta + n * (eta * cosi - sqrtf(fmaxf(k, 0.0f))));
-                throughput *= s.base;
-            }
-            ro = offsetRay(h.P, n, nd);
+            float w;
+            bool refracted;
+            if (!sampleDielectric(rd, h.Nout, s.ior, s.roughness, rng, nd, w, refracted)) break;
+            throughput *= w;
+            if (refracted) throughput *= s.base;
+            ro = offsetRay(h.P, h.Nout, nd);
             rd = nd;
             lastDelta = true;
             continue;
         }
+        ++scatter;
 
         const Onb onb = makeOnb(h.N);
         const float3 wo = toLocal(onb, rd * -1.0f);
@@ -301,7 +317,7 @@ __device__ PathOutput tracePath(float2 pix, Rng& rng, bool firstSample)
         rd = wi;
 
         // roulette russe
-        if (bounce >= 2) {
+        if (scatter >= 2) {
             const float q = fmaxf(0.05f, 1.0f - maxComp(throughput));
             if (rng.next() < q) break;
             throughput = throughput * (1.0f / (1.0f - q));

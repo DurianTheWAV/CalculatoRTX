@@ -34,8 +34,8 @@ public:
 private:
     struct Orbit {
         float yaw = 0.0f;
-        float pitch = 0.99f;  // ~57°
-        float distance = 29.0f;
+        float pitch = 0.90f;  // ~52° (la calculatrice est elle-même inclinée de 15°)
+        float distance = 32.0f;
         float fovY = 0.54f;   // ~31°
     };
 
