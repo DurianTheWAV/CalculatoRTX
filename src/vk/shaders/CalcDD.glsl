@@ -91,6 +91,67 @@ dvec2 twoProd(double a, double b)
     return dvec2(p, e * scale);
 }
 
+// ---------------------------------------------------------------- division et racine IEEE
+// Vulkan n'exige des instructions double qu'une précision "au moins simple précision" : sur
+// les vrais GPU (NVIDIA, AMD), a / b et sqrt() en double ne sont pas forcément arrondis
+// correctement. Ces versions n'utilisent le matériel que comme estimation, la corrigent
+// avec des résidus exacts (TwoProd), puis choisissent le double le plus proche : résultat
+// identique à l'arrondi IEEE du CPU, sur tous les GPU.
+#ifdef CRTX_CALC_SLOPPY_FP64  // test : simule un GPU dont a / b et sqrt() double n'ont que la précision simple
+#define CRTX_HW_DIV(a, b) double(float(a) / float(b))
+#define CRTX_HW_SQRT(a) double(sqrt(float(a)))
+#else
+#define CRTX_HW_DIV(a, b) ((a) / (b))
+#define CRTX_HW_SQRT(a) sqrt(a)
+#endif
+
+double quotResidual(double a, double b, double q)  // a - q b (exact au premier ordre)
+{
+    const dvec2 p = twoProd(q, b);
+    precise double r = (a - p.x) - p.y;
+    return r;
+}
+
+bool mantissaEven(double x) { return (unpackDouble2x32(x).x & 1u) == 0u; }
+
+double nearestOf3(double q, double rq, double qu, double ru, double qd, double rd)
+{
+    double best = q, rb = abs(rq);
+    ru = abs(ru);
+    rd = abs(rd);
+    if (ru < rb || (ru == rb && mantissaEven(qu))) { best = qu; rb = ru; }
+    if (rd < rb || (rd == rb && mantissaEven(qd))) best = qd;
+    return best;
+}
+
+double divD(double a, double b)
+{
+    if (!isFinD(a) || !isFinD(b) || a == 0.0LF || b == 0.0LF) return a / b;
+    int ea, eb;
+    const double ma = frexp(a, ea), mb = frexp(b, eb);  // |m| dans [0.5, 1)
+    precise double q = CRTX_HW_DIV(ma, mb);
+    for (int i = 0; i < 2; ++i) q = q + CRTX_HW_DIV(quotResidual(ma, mb, q), mb);  // ~2^-23 -> 2^-46 -> 2^-69
+    const double qu = nextUpD(q), qd = nextDownD(q);
+    q = nearestOf3(q, quotResidual(ma, mb, q), qu, quotResidual(ma, mb, qu), qd, quotResidual(ma, mb, qd));
+    return ldexpD(q, ea - eb);
+}
+
+double sqrtD(double a)
+{
+    if (!(a > 0.0LF) || !isFinD(a)) return sqrt(a);
+    int e;
+    double m = frexp(a, e);  // [0.5, 1)
+    if ((e & 1) != 0) {
+        m *= 2.0LF;  // [1, 2), exposant pair
+        e -= 1;
+    }
+    precise double s = CRTX_HW_SQRT(m);
+    for (int i = 0; i < 2; ++i) s = s + CRTX_HW_DIV(quotResidual(m, s, s), 2.0LF * s);
+    const double su = nextUpD(s), sd = nextDownD(s);
+    s = nearestOf3(s, quotResidual(m, s, s), su, quotResidual(m, su, su), sd, quotResidual(m, sd, sd));
+    return ldexp(s, e / 2);
+}
+
 dvec2 ddAdd(dvec2 a, dvec2 b)
 {
     dvec2 s = twoSum(a.x, b.x);
@@ -120,11 +181,11 @@ dvec2 ddMulD(dvec2 a, double b)
 
 dvec2 ddDiv(dvec2 a, dvec2 b)
 {
-    const double q1 = a.x / b.x;
+    const double q1 = divD(a.x, b.x);
     dvec2 r = ddSub(a, ddMulD(b, q1));
-    const double q2 = r.x / b.x;
+    const double q2 = divD(r.x, b.x);
     r = ddSub(r, ddMulD(b, q2));
-    const double q3 = r.x / b.x;
+    const double q3 = divD(r.x, b.x);
     const dvec2 q = quickTwoSum(q1, q2);
     return ddAdd(q, ddMake(q3));
 }
@@ -151,9 +212,9 @@ bool ddIsInteger(dvec2 a) { return ddIsFinite(a) && ddEq(ddFloor(a), a); }
 dvec2 ddSqrt(dvec2 a)
 {
     if (a.x <= 0.0LF) return ddMake(a.x == 0.0LF ? 0.0LF : qnanD());
-    const double x = sqrt(a.x);
+    const double x = sqrtD(a.x);
     const dvec2 r = ddSub(a, twoProd(x, x));
-    return quickTwoSum(x, r.x / (2.0LF * x));
+    return quickTwoSum(x, divD(r.x, 2.0LF * x));
 }
 
 double cbrtGuess(double x)  // x > 0 fini : estimation FP32 (~7 chiffres)
@@ -191,7 +252,7 @@ dvec2 ddExp(dvec2 a)
     if (a.x > 709.78LF) return ddMake(infD());
     if (a.x < -745.0LF) return ddMake(0.0LF);
     if (a.x == 0.0LF) return ddMake(1.0LF);
-    const double k = roundEven(a.x / kDdLn2.x);
+    const double k = roundEven(divD(a.x, kDdLn2.x));
     dvec2 r = ddSub(a, ddMulD(kDdLn2, k));
     r = ddLdexp(r, -10);  // réduction r / 2^10, série de expm1, puis 10 doublements
     dvec2 term = r;
@@ -261,7 +322,7 @@ void ddSinCosTaylor(dvec2 r, out dvec2 s, out dvec2 c)
 
 void ddSinCos(dvec2 a, out dvec2 s, out dvec2 c)
 {
-    const double k = roundEven(a.x / kDdPi2.x);
+    const double k = roundEven(divD(a.x, kDdPi2.x));
     const dvec2 r = ddSub(a, ddMulD(kDdPi2, k));
     dvec2 sr, cr;
     ddSinCosTaylor(r, sr, cr);

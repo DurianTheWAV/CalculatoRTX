@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace crtx {
@@ -70,7 +71,26 @@ App::~App()
 
 void App::initWindow()
 {
-    if (!glfwInit()) throwError("Échec d'initialisation de GLFW", __FILE__, __LINE__);
+    glfwSetErrorCallback([](int code, const char* text) { CRTX_LOG("GLFW (0x%x) : %s", code, text ? text : "?"); });
+    bool ok = glfwInit() == GLFW_TRUE;
+#if defined(GLFW_PLATFORM_X11) && defined(GLFW_PLATFORM_WAYLAND)
+    // GLFW 3.4 choisit Wayland dès que WAYLAND_DISPLAY est défini, sans repli : on essaie
+    // l'autre plateforme (XWayland / Wayland) avant d'abandonner.
+    for (int platform : {GLFW_PLATFORM_X11, GLFW_PLATFORM_WAYLAND}) {
+        if (ok || !glfwPlatformSupported(platform)) continue;
+        CRTX_LOG("Nouvel essai avec la plateforme GLFW %s", platform == GLFW_PLATFORM_X11 ? "X11" : "Wayland");
+        glfwInitHint(GLFW_PLATFORM, platform);
+        ok = glfwInit() == GLFW_TRUE;
+    }
+#endif
+    if (!ok) {
+        const char* x11 = std::getenv("DISPLAY");
+        const char* wl = std::getenv("WAYLAND_DISPLAY");
+        CRTX_LOG("Aucun affichage utilisable (DISPLAY=%s, WAYLAND_DISPLAY=%s) : lancez le programme depuis la session "
+                 "graphique (pas depuis une console texte / SSH sans affichage)",
+                 x11 ? x11 : "(non défini)", wl ? wl : "(non défini)");
+        throwError("Échec d'initialisation de GLFW", __FILE__, __LINE__);
+    }
     if (!glfwVulkanSupported()) throwError("Vulkan indisponible (pilote graphique / chargeur Vulkan ?)", __FILE__, __LINE__);
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
