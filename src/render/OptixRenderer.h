@@ -1,6 +1,7 @@
 // CalculatoRTX - moteur de rendu OptiX (RT cores) + débruiteur IA (Tensor cores).
 #pragma once
 
+#include "../backends/Backend.h"
 #include "../scene/CalculatorScene.h"
 #include "LaunchParams.h"
 
@@ -12,14 +13,6 @@
 
 namespace crtx {
 
-struct RenderSettings {
-    unsigned spp = 1;
-    unsigned maxBounces = 5;
-    bool ser = true;
-    bool denoise = true;
-    bool fireflyClamp = true;
-};
-
 struct FrameInput {
     CameraData camera;
     CameraData prevCamera;
@@ -29,6 +22,11 @@ struct FrameInput {
     unsigned frameIndex = 0;
     float time = 0.0f;
 };
+
+// Deux cibles de rendu indépendantes (tampons + débruiteur) : 0 = résolution DLSS (images en
+// mouvement), 1 = résolution native (accumulation progressive quand l'image est immobile).
+constexpr int kTargetMotion = 0;
+constexpr int kTargetStatic = 1;
 
 class OptixRenderer {
 public:
@@ -42,25 +40,27 @@ public:
     // Synchronise la scène (maillages marqués "dirty", instances, matériaux, lumières).
     void syncScene(CalculatorScene& scene, cudaStream_t stream);
 
-    void resize(unsigned width, unsigned height);
-    unsigned width() const { return width_; }
-    unsigned height() const { return height_; }
+    // Dimensionne une cible (0 x 0 : libère la cible).
+    void resize(int target, unsigned width, unsigned height);
+    unsigned width(int target) const { return targets_[target].width; }
+    unsigned height(int target) const { return targets_[target].height; }
 
     // Lance le path tracing puis (optionnellement) le débruiteur. Retourne le buffer
-    // couleur final (float4, résolution de rendu).
-    const float4* render(const FrameInput& in, const RenderSettings& rs, cudaStream_t stream);
+    // couleur final (float4, résolution de la cible).
+    const float4* render(int target, const FrameInput& in, const RenderSettings& rs, cudaStream_t stream);
 
     // Lance un rayon de sélection ; le résultat est copié en mémoire hôte (lu à l'image suivante).
-    void pick(const CameraData& cam, float2 pixel, cudaStream_t stream);
+    void pick(int target, const CameraData& cam, float2 pixel, cudaStream_t stream);
     int pickResult() const { return *hostPick_; }
 
-    const float* depthBuffer() const { return depth_; }
-    const float2* motionBuffer() const { return motion_; }
+    const float* depthBuffer(int target) const { return targets_[target].depth; }
+    const float2* motionBuffer(int target) const { return targets_[target].motion; }
 
     // Chronomètres GPU (ms) de la dernière image
     float lastTraceMs() const { return traceMs_; }
     float lastDenoiseMs() const { return denoiseMs_; }
-    unsigned accumulatedFrames() const { return accumCount_; }
+    unsigned accumulatedFrames(int target) const { return targets_[target].accumCount; }
+    void resetAccumulation(int target) { targets_[target].accumCount = 0; }
 
 private:
     struct Gas {
@@ -71,6 +71,18 @@ private:
         size_t triangles = 0;
         bool alpha = false;
     };
+    struct Target {
+        unsigned width = 0, height = 0;
+        float4* block = nullptr;  // color | albedo | normal | denoised | accum (bloc contigu)
+        float4 *color = nullptr, *albedo = nullptr, *normal = nullptr, *accum = nullptr, *denoised = nullptr;
+        float* depth = nullptr;
+        float2* motion = nullptr;
+        unsigned accumCount = 0;
+        // débruiteur IA OptiX (réseau de neurones exécuté sur les Tensor cores)
+        OptixDenoiser denoiser = nullptr;
+        CUdeviceptr state = 0, scratch = 0, intensity = 0;
+        size_t stateSize = 0, scratchSize = 0;
+    };
 
     void createContext();
     void createModuleAndPipeline(const std::vector<unsigned char>& ptx);
@@ -79,11 +91,10 @@ private:
     void freeGas(Gas& gas);
     void buildOpacityMicromap(Gas& gas, const Mesh& mesh, cudaStream_t stream);
     void buildIas(const CalculatorScene& scene, cudaStream_t stream);
-    void setupDenoiser();
-    void destroyDenoiser();
-    void freeFrameBuffers();
+    void setupDenoiser(Target& t);
+    void destroyTarget(Target& t);
     void createEnvironment();
-    void applyL2Persistence(cudaStream_t stream);
+    void applyL2Persistence(int target, cudaStream_t stream);
 
     OptixDeviceContext context_ = nullptr;
     OptixModule module_ = nullptr;
@@ -108,18 +119,8 @@ private:
     unsigned numLights_ = 0;
     std::vector<Affine> prevTransforms_;
 
-    // images (résolution de rendu)
-    unsigned width_ = 0, height_ = 0;
-    float4* frameBlock_ = nullptr;  // color | albedo | normal | accum | denoised (bloc contigu)
-    float4 *color_ = nullptr, *albedo_ = nullptr, *normal_ = nullptr, *accum_ = nullptr, *denoised_ = nullptr;
-    float* depth_ = nullptr;
-    float2* motion_ = nullptr;
-    unsigned accumCount_ = 0;
-
-    // débruiteur IA OptiX (réseau de neurones exécuté sur les Tensor cores)
-    OptixDenoiser denoiser_ = nullptr;
-    CUdeviceptr denoiserState_ = 0, denoiserScratch_ = 0, denoiserIntensity_ = 0;
-    size_t denoiserStateSize_ = 0, denoiserScratchSize_ = 0;
+    Target targets_[2];
+    int l2Target_ = -1;  // cible couverte par la fenêtre persistante du cache L2
 
     // environnement (texture HDR latitude-longitude générée sur GPU)
     cudaArray_t envArray_ = nullptr;
@@ -133,7 +134,7 @@ private:
     cudaEvent_t evTrace0_ = nullptr, evTrace1_ = nullptr, evDenoise1_ = nullptr;
     float traceMs_ = 0.0f, denoiseMs_ = 0.0f;
     bool timingPending_ = false;
-    bool l2Configured_ = false;
+    bool timingDenoised_ = false;
 };
 
 }  // namespace crtx

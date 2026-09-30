@@ -447,8 +447,13 @@ void CalculatorScene::buildBody()
         TextFrame f = brandFrame;
         const float solarLeft = solar.center.x - solar.size.x * 0.5f;
         f.origin = make_float3(0.5f * (brandEnd + solarLeft), kBodyT, stripZ + 0.12f);
-        const std::string dot = std::string(" ") + G(glyph::kBullet) + " ";
-        addText(m, font_, "RTX 4070 Ti" + dot + "OptiX" + dot + "DLSS" + dot + "CUDA", f, st, TextAlign::Center);
+        // mention du GPU et des technologies utilisées ('|' = puce séparatrice), réduite si trop longue
+        std::string text;
+        for (char c : badge_) text += c == '|' ? std::string(" ") + G(glyph::kBullet) + " " : std::string(1, c);
+        const float room = solarLeft - brandEnd - 0.8f;
+        const float w = font_.measure(text) * st.size;
+        if (w > room) st.size *= room / w;
+        addText(m, font_, text, f, st, TextAlign::Center);
         addPart(std::move(m), kMatBrandGreen);
     }
 }

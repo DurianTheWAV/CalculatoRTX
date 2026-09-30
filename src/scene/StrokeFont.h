@@ -3,7 +3,7 @@
 // Aucune texture : le texte de l'afficheur et des touches est entièrement ray tracé.
 #pragma once
 
-#include <cuda_runtime.h>
+#include "../common/VectorTypes.h"
 
 #include <string>
 #include <vector>

@@ -220,7 +220,8 @@ __device__ PathOutput tracePath(float2 pix, Rng& rng, bool firstSample)
         if (!guideDone && (!isGlass || bounce >= 3 || m.haze > 0.0f)) {
             const float3 a = (isGlass && m.haze > 0.0f) ? m.hazeColor : s.base;  // guide stable (non aléatoire)
             out.albedo = fminf3(a + s.emission, make_float3(1, 1, 1));
-            out.normal = h.N;
+            // Le débruiteur IA attend des normales en repère caméra (x droite, y haut, z vers l'observateur)
+            out.normal = make_float3(dot(h.N, normalize(cam.U)), dot(h.N, normalize(cam.V)), -dot(h.N, cam.W));
             guideDone = true;
         }
 

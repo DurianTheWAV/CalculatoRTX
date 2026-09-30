@@ -1,0 +1,22 @@
+// CalculatoRTX - quantification 8 bits + tramage, ordre BGRA ou RGBA de la swapchain.
+//   pc.src LDR sRGB (dstW x dstH)  pc.dst octets (1 uint par pixel)  pc.u0 = 1 si BGRA  pc.u1 = n° d'image
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "Post.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main()
+{
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.dstW || p.y >= pc.dstH) return;
+    const vec3 c = PVec4(pc.src).v[p.y * pc.dstW + p.x].rgb;
+    // tramage (bruit approché) pour éviter les bandes en 8 bits, identique au backend CUDA
+    const uint hsh = (p.x * 1973u + p.y * 9277u + pc.u1 * 26699u) | 1u;
+    const uint r = (hsh ^ (hsh >> 13)) * 0x5bd1e995u;
+    const float dither = float((r >> 8) & 0xFFu) / 255.0 - 0.5;
+    const uvec3 q = uvec3(clamp(c * 255.0 + dither + 0.5, vec3(0.0), vec3(255.0)));
+    const uint packed = pc.u0 != 0u ? (q.z | (q.y << 8) | (q.x << 16) | (255u << 24))
+                                    : (q.x | (q.y << 8) | (q.z << 16) | (255u << 24));
+    PUint(pc.dst).v[p.y * pc.dstW + p.x] = packed;
+}

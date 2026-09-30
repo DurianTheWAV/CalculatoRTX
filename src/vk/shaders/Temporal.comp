@@ -1,0 +1,87 @@
+// CalculatoRTX - accumulation temporelle des images en mouvement (backend Vulkan).
+//
+// L'historique (radiance moyenne + nombre d'images) est reprojeté grâce aux vecteurs de
+// mouvement du path tracer, rejeté en cas de désocclusion (profondeur différente) et borné
+// par le voisinage 3x3 de l'image courante, puis mélangé avec l'image courante : environ
+// dix fois plus d'échantillons effectifs pendant les mouvements de caméra, avant le
+// débruiteur à-trous et AMD FSR 1 (le rôle temporel que joue DLSS côté NVIDIA).
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer TVec4 { vec4 v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer TVec2 { vec2 v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer TFloat { float v[]; };
+
+// Miroir de TemporalPush (src/vk/VkRenderer.cpp)
+layout(push_constant, scalar) uniform Push {
+    uint64_t color;      // radiance de l'image courante
+    uint64_t normal;     // normale + profondeur courantes
+    uint64_t motion;     // déplacement vers l'image précédente (pixels)
+    uint64_t histIn;     // historique précédent (rgb, nombre d'images)
+    uint64_t histOut;    // historique mis à jour
+    uint64_t depthIn;    // profondeur de l'image précédente
+    uint64_t depthOut;   // profondeur de l'image courante (pour la suivante)
+    uint width, height;
+    uint valid;          // 0 : pas d'historique utilisable
+    float maxHistory;    // nombre maximal d'images mélangées
+} pc;
+
+void main()
+{
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const int w = int(pc.width), h = int(pc.height);
+    if (p.x >= w || p.y >= h) return;
+    const uint ip = uint(p.y * w + p.x);
+    TVec4 color = TVec4(pc.color);
+    const vec3 cur = color.v[ip].rgb;
+    const float depth = TVec4(pc.normal).v[ip].w;
+    TFloat(pc.depthOut).v[ip] = depth;
+
+    vec3 result = cur;
+    float count = 1.0;
+    if (pc.valid != 0u) {
+        const vec2 prev = vec2(p) + 0.5 + TVec2(pc.motion).v[ip] - 0.5;  // centre de pixel précédent
+        const ivec2 q0 = ivec2(floor(prev));
+        const vec2 t = prev - vec2(q0);
+        vec3 hist = vec3(0.0);
+        float hcount = 0.0, wsum = 0.0;
+        for (int j = 0; j < 2; ++j) {
+            for (int i = 0; i < 2; ++i) {
+                const ivec2 q = q0 + ivec2(i, j);
+                if (q.x < 0 || q.y < 0 || q.x >= w || q.y >= h) continue;
+                const uint iq = uint(q.y * w + q.x);
+                const float dz = abs(TFloat(pc.depthIn).v[iq] - depth);
+                if (dz > 0.03 * abs(depth) + 0.05) continue;  // désocclusion
+                const float wt = (i == 0 ? 1.0 - t.x : t.x) * (j == 0 ? 1.0 - t.y : t.y);
+                const vec4 hv = TVec4(pc.histIn).v[iq];
+                hist += hv.rgb * wt;
+                hcount += hv.a * wt;
+                wsum += wt;
+            }
+        }
+        if (wsum > 1e-3) {
+            hist /= wsum;
+            hcount /= wsum;
+            // bornes du voisinage 3x3 courant (élargies : l'image courante est bruitée)
+            vec3 lo = cur, hi = cur;
+            for (int j = -1; j <= 1; ++j) {
+                for (int i = -1; i <= 1; ++i) {
+                    const ivec2 q = clamp(p + ivec2(i, j), ivec2(0), ivec2(w - 1, h - 1));
+                    const vec3 c = color.v[q.y * w + q.x].rgb;
+                    lo = min(lo, c);
+                    hi = max(hi, c);
+                }
+            }
+            const vec3 ext = (hi - lo) * 0.5;
+            hist = clamp(hist, lo - ext, hi + ext);
+            count = min(hcount + 1.0, pc.maxHistory);
+            result = mix(hist, cur, 1.0 / count);
+        }
+    }
+    if (any(isnan(result)) || any(isinf(result))) result = cur;
+    TVec4(pc.histOut).v[ip] = vec4(result, count);
+}

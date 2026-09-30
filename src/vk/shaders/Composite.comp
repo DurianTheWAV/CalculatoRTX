@@ -1,0 +1,48 @@
+// CalculatoRTX - composition finale (backend Vulkan), portage de src/render/Kernels.cu :
+// exposition -> bloom -> vignettage -> tone mapping ACES -> encodage sRGB.
+// Le résultat reste en flottants (espace perceptuel) pour AMD FSR 1, qui travaille après
+// le tone mapping ; la quantification 8 bits se fait à la toute fin (Pack.comp).
+//   pc.src HDR (srcW x srcH)  pc.aux0 bloom (dstW x dstH)  pc.dst LDR (srcW x srcH)
+//   pc.p0 exposition  pc.p1 intensité du bloom  pc.p2 vignettage
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "Post.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+vec3 acesFilm(vec3 x)
+{
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+float linearToSrgb(float v)
+{
+    v = clamp(v, 0.0, 1.0);
+    return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+
+vec3 sampleBloom(PVec4 b, int bw, int bh, float u, float v)
+{
+    const float fx = u * float(bw) - 0.5, fy = v * float(bh) - 0.5;
+    const int x0 = clamp(int(floor(fx)), 0, bw - 1), y0 = clamp(int(floor(fy)), 0, bh - 1);
+    const int x1 = min(bw - 1, x0 + 1), y1 = min(bh - 1, y0 + 1);
+    const float tx = clamp(fx - float(x0), 0.0, 1.0), ty = clamp(fy - float(y0), 0.0, 1.0);
+    const vec3 a = mix(b.v[y0 * bw + x0].rgb, b.v[y0 * bw + x1].rgb, tx);
+    const vec3 c = mix(b.v[y1 * bw + x0].rgb, b.v[y1 * bw + x1].rgb, tx);
+    return mix(a, c, ty);
+}
+
+void main()
+{
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const int w = int(pc.srcW), h = int(pc.srcH);
+    if (p.x >= w || p.y >= h) return;
+    const float u = (float(p.x) + 0.5) / float(w), v = (float(p.y) + 0.5) / float(h);
+    vec3 c = PVec4(pc.src).v[p.y * w + p.x].rgb * pc.p0;
+    c += sampleBloom(PVec4(pc.aux0), int(pc.dstW), int(pc.dstH), u, v) * pc.p1;  // fraction de l'énergie au-dessus du seuil
+    const float dx = u - 0.5, dy = v - 0.5;
+    c = c * (1.0 - pc.p2 * (dx * dx + dy * dy) * 2.0);
+    c = acesFilm(c);
+    PVec4(pc.dst).v[p.y * w + p.x] = vec4(linearToSrgb(c.x), linearToSrgb(c.y), linearToSrgb(c.z), 1.0);
+}

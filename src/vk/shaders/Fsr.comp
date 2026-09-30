@@ -1,0 +1,74 @@
+// CalculatoRTX - AMD FidelityFX Super Resolution 1.0 (backend Vulkan).
+//   CRTX_FSR_EASU : suréchantillonnage spatial adaptatif aux contours (rendu -> affichage)
+//   CRTX_FSR_RCAS : netteté adaptative au contraste (résolution d'affichage), pc.p0 = atténuation (stops)
+// Code d'AMD (licence MIT, third_party/fsr1) ; les lectures de texture ("gather") sont
+// émulées sur un tampon lu par adresse GPU.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "Post.glsl"
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+vec4 loadTexel(ivec2 q)
+{
+    q = clamp(q, ivec2(0), ivec2(int(pc.srcW) - 1, int(pc.srcH) - 1));
+    return PVec4(pc.src).v[q.y * int(pc.srcW) + q.x];
+}
+
+#if defined(CRTX_FSR_EASU)
+#define FSR_EASU_F 1
+
+// Équivalent de textureGather(tex, p, canal) : texels (0,1) (1,1) (1,0) (0,0) du carré 2x2
+vec4 gatherChannel(vec2 p, int ch)
+{
+    const vec2 f = p * vec2(float(pc.srcW), float(pc.srcH)) - 0.5;
+    const ivec2 i0 = ivec2(floor(f));
+    return vec4(loadTexel(i0 + ivec2(0, 1))[ch], loadTexel(i0 + ivec2(1, 1))[ch], loadTexel(i0 + ivec2(1, 0))[ch],
+                loadTexel(i0)[ch]);
+}
+AF4 FsrEasuRF(AF2 p) { return gatherChannel(p, 0); }
+AF4 FsrEasuGF(AF2 p) { return gatherChannel(p, 1); }
+AF4 FsrEasuBF(AF2 p) { return gatherChannel(p, 2); }
+
+#include "ffx_fsr1.h"
+
+void main()
+{
+    const uvec2 ip = gl_GlobalInvocationID.xy;
+    if (ip.x >= pc.dstW || ip.y >= pc.dstH) return;
+    const float inW = float(pc.srcW), inH = float(pc.srcH), outW = float(pc.dstW), outH = float(pc.dstH);
+    // Constantes de FsrEasuCon() (identiques, calculées ici)
+    const uvec4 con0 = uvec4(floatBitsToUint(inW / outW), floatBitsToUint(inH / outH),
+                             floatBitsToUint(0.5 * inW / outW - 0.5), floatBitsToUint(0.5 * inH / outH - 0.5));
+    const uvec4 con1 = uvec4(floatBitsToUint(1.0 / inW), floatBitsToUint(1.0 / inH), floatBitsToUint(1.0 / inW),
+                             floatBitsToUint(-1.0 / inH));
+    const uvec4 con2 = uvec4(floatBitsToUint(-1.0 / inW), floatBitsToUint(2.0 / inH), floatBitsToUint(1.0 / inW),
+                             floatBitsToUint(2.0 / inH));
+    const uvec4 con3 = uvec4(floatBitsToUint(0.0), floatBitsToUint(4.0 / inH), 0u, 0u);
+    vec3 c;
+    FsrEasuF(c, ip, con0, con1, con2, con3);
+    PVec4(pc.dst).v[ip.y * pc.dstW + ip.x] = vec4(c, 1.0);
+}
+
+#elif defined(CRTX_FSR_RCAS)
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return loadTexel(ivec2(p)); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+
+#include "ffx_fsr1.h"
+
+void main()
+{
+    const uvec2 ip = gl_GlobalInvocationID.xy;
+    if (ip.x >= pc.dstW || ip.y >= pc.dstH) return;
+    const float s = exp2(-pc.p0);  // FsrRcasCon()
+    const uvec4 con = uvec4(floatBitsToUint(s), packHalf2x16(vec2(s)), 0u, 0u);
+    float r, g, b;
+    FsrRcasF(r, g, b, ip, con);
+    PVec4(pc.dst).v[ip.y * pc.dstW + ip.x] = vec4(r, g, b, 1.0);
+}
+#endif

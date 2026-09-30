@@ -1,0 +1,50 @@
+// CalculatoRTX - bloom (backend Vulkan), portage de src/render/Kernels.cu.
+//   CRTX_BLOOM_DOWN : réduction 4x4 avec seuil (pc.src HDR -> pc.dst quart de résolution)
+//                     pc.p0 exposition, pc.p1 seuil
+//   sinon           : flou gaussien séparable 13 taps (pc.u0 = dx, pc.u1 = dy)
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "Post.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#if defined(CRTX_BLOOM_DOWN)
+void main()
+{
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.dstW) || p.y >= int(pc.dstH)) return;
+    PVec4 src = PVec4(pc.src);
+    vec3 sum = vec3(0.0);
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            const int sx = min(p.x * 4 + i, int(pc.srcW) - 1), sy = min(p.y * 4 + j, int(pc.srcH) - 1);
+            const vec3 c = src.v[sy * int(pc.srcW) + sx].rgb * pc.p0;
+            const float l = luminanceP(c);
+            const float k = max(l - pc.p1, 0.0) / max(l, 1e-4);
+            sum += c * k;
+        }
+    }
+    PVec4(pc.dst).v[p.y * int(pc.dstW) + p.x] = vec4(sum * (1.0 / 16.0), 1.0);
+}
+#else
+const float kGauss[13] = float[13](0.0450, 0.0605, 0.0763, 0.0909, 0.1024, 0.1091, 0.1117, 0.1091, 0.1024, 0.0909,
+                                   0.0763, 0.0605, 0.0450);
+void main()
+{
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const int bw = int(pc.dstW), bh = int(pc.dstH);
+    if (p.x >= bw || p.y >= bh) return;
+    PVec4 src = PVec4(pc.src);
+    const int dx = int(pc.u0), dy = int(pc.u1);
+    vec3 s = vec3(0.0);
+    float wsum = 0.0;
+    for (int k = -6; k <= 6; ++k) {
+        const int sx = clamp(p.x + k * dx * 2, 0, bw - 1);
+        const int sy = clamp(p.y + k * dy * 2, 0, bh - 1);
+        const float wgt = kGauss[k + 6];
+        s += src.v[sy * bw + sx].rgb * wgt;
+        wsum += wgt;
+    }
+    PVec4(pc.dst).v[p.y * bw + p.x] = vec4(s / wsum, 1.0);
+}
+#endif

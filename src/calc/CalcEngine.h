@@ -1,7 +1,7 @@
-// CalculatoRTX - moteur de calcul exécuté intégralement sur le GPU (CUDA).
+// CalculatoRTX - moteur de calcul exécuté intégralement sur le GPU (CUDA, backend NVIDIA).
 #pragma once
 
-#include "CalcTypes.h"
+#include "ICalcEngine.h"
 
 #include <cuda_runtime.h>
 
@@ -10,16 +10,16 @@
 namespace crtx {
 namespace calc {
 
-class CalcEngine {
+class CalcEngine : public ICalcEngine {
 public:
     CalcEngine();
-    ~CalcEngine();
+    ~CalcEngine() override;
     CalcEngine(const CalcEngine&) = delete;
     CalcEngine& operator=(const CalcEngine&) = delete;
 
-    // Envoie le programme au GPU, attend le résultat (quelques dizaines de µs).
-    Result evaluate(const std::string& program, AngleMode mode, double ansHi, double ansLo,
-                    double memHi, double memLo, float* gpuMicroseconds = nullptr);
+    Result evaluate(const std::string& program, AngleMode mode, double ansHi, double ansLo, double memHi,
+                    double memLo, float* gpuMicroseconds = nullptr) override;
+    const char* apiName() const override { return "CUDA"; }
 
 private:
     cudaStream_t stream_ = nullptr;
@@ -30,9 +30,6 @@ private:
     Request* devReq_ = nullptr;
     Result* devRes_ = nullptr;
 };
-
-// Auto-test exécuté au démarrage (vérifie quelques expressions de référence sur GPU).
-bool runSelfTest(CalcEngine& engine);
 
 }  // namespace calc
 }  // namespace crtx

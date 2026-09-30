@@ -1,0 +1,404 @@
+// CalculatoRTX - path tracer du backend Vulkan (AMD Radeon RX 6000+, Intel Arc, NVIDIA RTX).
+//
+// Même algorithme que le backend OptiX (src/render/device/Programs.cu) : traversée BVH
+// matérielle des accélérateurs de ray tracing par VK_KHR_ray_query (inline ray tracing
+// dans un compute shader), éclairage direct par échantillonnage des luminaires + MIS,
+// ombres douces, réflexions GGX, verre et plastique dépoli avec absorption, grille
+// perforée par intersections candidates (géométrie non opaque), illumination globale.
+// Compilé deux fois : rendu (défaut) et sélection d'une touche sous le curseur (CRTX_PICK).
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "Common.glsl"
+#include "Grille.glsl"
+#include "Shading.glsl"
+
+#if defined(CRTX_PICK)
+layout(local_size_x = 1) in;
+#else
+layout(local_size_x = 8, local_size_y = 8) in;
+#endif
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1) uniform sampler2D envTex;
+layout(set = 0, binding = 2, scalar) uniform FrameUbo { FrameParams fp; };
+
+struct Hit {
+    vec3 P;       // position monde
+    vec3 Pobj;    // position objet
+    vec3 N;       // normale d'ombrage orientée vers le rayon incident
+    vec3 Ng;      // normale géométrique orientée vers le rayon incident
+    vec3 Nout;    // normale "extérieure" du maillage (verre : entrée / sortie)
+    vec3 dirObj;  // direction du rayon dans le repère de l'objet
+    vec2 uv;
+    float t;
+    int instance;
+};
+
+struct RawHit {
+    int instance;
+    int prim;
+    vec2 bc;
+    float t;
+    mat4x3 o2w;
+    mat4x3 w2o;
+};
+
+vec3 cameraRay(CameraData c, vec2 pix)
+{
+    const float nx = 2.0 * pix.x / float(fp.width) - 1.0;
+    const float ny = 1.0 - 2.0 * pix.y / float(fp.height);
+    return normalize(c.U * nx + c.V * ny + c.W);
+}
+
+vec3 envRadiance(vec3 d)
+{
+    const float u = atan(d.x, -d.z) * (0.5 * kInvPi) + 0.5;
+    const float v = acos(clamp(d.y, -1.0, 1.0)) * kInvPi;
+    return textureLod(envTex, vec2(u, v), 0.0).rgb * fp.envIntensity;
+}
+
+// Intersection candidate sur la grille perforée : vrai si le point tombe dans un trou
+bool cutoutHole(int instance, int prim, vec2 bc)
+{
+    const InstanceData inst = InstanceBuf(fp.instances).d[instance];
+    const GeometryData g = GeometryBuf(fp.geometries).g[inst.geometry];
+    if (g.uvs == 0ul) return false;
+    const uvec3 tri = UVec3Buf(g.indices).v[prim];
+    Vec2Buf uvs = Vec2Buf(g.uvs);
+    const vec2 uv = uvs.v[tri.x] * (1.0 - bc.x - bc.y) + uvs.v[tri.y] * bc.x + uvs.v[tri.z] * bc.y;
+    return grilleSdf(uv) < 0.0;
+}
+
+bool traceClosest(vec3 ro, vec3 rd, uint mask, out RawHit h)
+{
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, tlas, gl_RayFlagsNoneEXT, mask, ro, 0.0, rd, 1e16);
+    while (rayQueryProceedEXT(q)) {
+        if (rayQueryGetIntersectionTypeEXT(q, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            const int inst = rayQueryGetIntersectionInstanceCustomIndexEXT(q, false);
+            const int prim = rayQueryGetIntersectionPrimitiveIndexEXT(q, false);
+            if (!cutoutHole(inst, prim, rayQueryGetIntersectionBarycentricsEXT(q, false)))
+                rayQueryConfirmIntersectionEXT(q);
+        }
+    }
+    h.instance = -1;
+    h.prim = 0;
+    h.bc = vec2(0.0);
+    h.t = 0.0;
+    h.o2w = mat4x3(1.0);
+    h.w2o = mat4x3(1.0);
+    if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionTriangleEXT) return false;
+    h.instance = rayQueryGetIntersectionInstanceCustomIndexEXT(q, true);
+    h.prim = rayQueryGetIntersectionPrimitiveIndexEXT(q, true);
+    h.bc = rayQueryGetIntersectionBarycentricsEXT(q, true);
+    h.t = rayQueryGetIntersectionTEXT(q, true);
+    h.o2w = rayQueryGetIntersectionObjectToWorldEXT(q, true);
+    h.w2o = rayQueryGetIntersectionWorldToObjectEXT(q, true);
+    return true;
+}
+
+bool occluded(vec3 o, vec3 d, float tmax)
+{
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, tlas, gl_RayFlagsTerminateOnFirstHitEXT, kMaskSolid, o, 0.0, d, tmax);
+    while (rayQueryProceedEXT(q)) {
+        if (rayQueryGetIntersectionTypeEXT(q, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            const int inst = rayQueryGetIntersectionInstanceCustomIndexEXT(q, false);
+            const int prim = rayQueryGetIntersectionPrimitiveIndexEXT(q, false);
+            if (!cutoutHole(inst, prim, rayQueryGetIntersectionBarycentricsEXT(q, false)))
+                rayQueryConfirmIntersectionEXT(q);
+        }
+    }
+    return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+#if defined(CRTX_PICK)
+// ============================================================ sélection par rayon
+void main()
+{
+    const vec3 d = cameraRay(fp.cam, vec2(fp.pickX, fp.pickY));
+    RawHit h;
+    int id = -1;
+    if (traceClosest(fp.cam.eye, d, kMaskSolid, h)) id = InstanceBuf(fp.instances).d[h.instance].pickId;
+    IntBuf(fp.pickResult).v[0] = id;
+}
+#else
+
+Hit fetchHit(RawHit r, vec3 rayDir)
+{
+    Hit h;
+    h.instance = r.instance;
+    h.t = r.t;
+    const InstanceData inst = InstanceBuf(fp.instances).d[r.instance];
+    const GeometryData g = GeometryBuf(fp.geometries).g[inst.geometry];
+    const uvec3 tri = UVec3Buf(g.indices).v[r.prim];
+    Vec3Buf pos = Vec3Buf(g.positions);
+    const vec3 p0 = pos.v[tri.x], p1 = pos.v[tri.y], p2 = pos.v[tri.z];
+    const float w0 = 1.0 - r.bc.x - r.bc.y;
+    h.Pobj = p0 * w0 + p1 * r.bc.x + p2 * r.bc.y;
+    h.P = r.o2w * vec4(h.Pobj, 1.0);
+    const mat3 W = mat3(r.w2o);
+    h.dirObj = W * rayDir;
+
+    vec3 ng = normalize(cross(p1 - p0, p2 - p0) * W);  // transposée de l'inverse
+    vec3 ns = ng;
+    if (g.normals != 0ul) {
+        Vec3Buf nrm = Vec3Buf(g.normals);
+        const vec3 n = nrm.v[tri.x] * w0 + nrm.v[tri.y] * r.bc.x + nrm.v[tri.z] * r.bc.y;
+        ns = normalize(n * W);
+        if (dot(ns, ng) < 0.0) ng = -ng;  // aligne la normale géométrique sur l'extérieur
+    }
+    h.Nout = ns;
+    h.uv = vec2(0.0);
+    if (g.uvs != 0ul) {
+        Vec2Buf uvs = Vec2Buf(g.uvs);
+        h.uv = uvs.v[tri.x] * w0 + uvs.v[tri.y] * r.bc.x + uvs.v[tri.z] * r.bc.y;
+    }
+    if (dot(ng, rayDir) > 0.0) {
+        ng = -ng;
+        ns = -ns;
+    }
+    if (dot(ns, rayDir) > 0.0) ns = normalize(ns - rayDir * (dot(ns, rayDir) * 1.01));
+    h.Ng = ng;
+    h.N = ns;
+    return h;
+}
+
+vec3 offsetRay(vec3 p, vec3 n, vec3 dir)
+{
+    const float eps = 2e-4 * (1.0 + max(abs(p.x), max(abs(p.y), abs(p.z))));
+    return p + n * (dot(dir, n) > 0.0 ? eps : -eps);
+}
+
+vec3 clampLum(vec3 c, float maxLum)
+{
+    const float l = luminance(c);
+    return l > maxLum ? c * (maxLum / l) : c;
+}
+
+struct PathOutput {
+    vec3 radiance;
+    vec3 albedo;
+    vec3 normal;
+    float depth;
+    vec2 motion;  // déplacement (pixels) vers la position du point dans l'image précédente
+};
+
+bool projectToPixel(CameraData c, vec3 X, out vec2 pix)
+{
+    const vec3 d = X - c.eye;
+    const float z = dot(d, c.W);
+    pix = vec2(0.0);
+    if (z < 1e-4) return false;
+    const float nx = dot(d, c.U) / (dot(c.U, c.U) * z);
+    const float ny = dot(d, c.V) / (dot(c.V, c.V) * z);
+    pix = vec2((nx + 1.0) * 0.5 * float(fp.width), (1.0 - ny) * 0.5 * float(fp.height));
+    return true;
+}
+
+PathOutput tracePath(vec2 pix, inout Rng rng, bool firstSample)
+{
+    const CameraData cam = fp.cam;
+    vec3 ro = cam.eye;
+    vec3 rd = cameraRay(cam, pix);
+
+    PathOutput outp;
+    outp.radiance = vec3(0.0);
+    outp.albedo = vec3(0.0);
+    outp.normal = vec3(0.0);
+    outp.depth = 1e4;
+    outp.motion = vec2(0.0);
+
+    vec3 throughput = vec3(1.0);
+    float lastPdf = 0.0;
+    bool lastDelta = true;  // le rayon primaire compte comme "spéculaire"
+    bool guideDone = !firstSample;
+    const bool clampFire = (fp.flags & kFlagFireflyClamp) != 0u;
+    const uint maxGlassEvents = 8u;
+    uint scatter = 0u;
+    MaterialBuf materials = MaterialBuf(fp.materials);
+    InstanceBuf instances = InstanceBuf(fp.instances);
+    LightBuf lights = LightBuf(fp.lights);
+
+    for (uint bounce = 0u; bounce <= fp.maxBounces + maxGlassEvents; ++bounce) {
+        RawHit raw;
+        if (!traceClosest(ro, rd, kMaskAll, raw)) {
+            const vec3 env = envRadiance(rd);
+            vec3 c = throughput * env;
+            if (clampFire && bounce > 0u) c = clampLum(c, 20.0);
+            outp.radiance += c;
+            if (!guideDone) {
+                outp.albedo = min(env, vec3(1.0));
+                outp.normal = vec3(0.0);
+                guideDone = true;
+            }
+            if (bounce == 0u && firstSample) {
+                vec2 prev;
+                if (projectToPixel(fp.prevCam, fp.prevCam.eye + rd * 1000.0, prev)) outp.motion = prev - pix;
+            }
+            break;
+        }
+
+        const Hit h = fetchHit(raw, rd);
+        const InstanceData inst = instances.d[h.instance];
+        const Material m = materials.m[inst.material];
+        Surface s = evalMaterial(m, h.Pobj, h.uv);
+        bool isGlass = s.transmission > 0.5;
+
+        if (bounce == 0u && firstSample) {
+            outp.depth = dot(h.P - cam.eye, cam.W);
+            vec2 prev;
+            if (projectToPixel(fp.prevCam, xformPoint12(inst.prevObjectToWorld, h.Pobj), prev)) outp.motion = prev - pix;
+        }
+        if (!guideDone && (!isGlass || bounce >= 3u || m.haze > 0.0)) {
+            const vec3 a = (isGlass && m.haze > 0.0) ? m.hazeColor : s.base;
+            outp.albedo = min(a + s.emission, vec3(1.0));
+            outp.normal = h.N;
+            guideDone = true;
+        }
+
+        // ---- émission (surbrillance des touches incluse)
+        vec3 Le = s.emission * (1.0 + 1.5 * inst.glow) + inst.glowColor * (inst.glow * 0.5);
+        if (m.emitUpOnly > 0.5 && h.dirObj.y > 0.0) Le = vec3(0.0);  // vu par en dessous
+        if (inst.lightIndex >= 0) {
+            const RectLight L = lights.l[inst.lightIndex];
+            const float cosL = -dot(rd, L.normal);
+            if (cosL <= 0.0) Le = vec3(0.0);
+            else if (!lastDelta) {
+                const float pdfL = h.t * h.t / (cosL * L.area * float(fp.numLights));
+                const float w = lastPdf * lastPdf / (lastPdf * lastPdf + pdfL * pdfL);
+                Le = Le * w;
+            }
+        }
+        if (maxComp(Le) > 0.0) {
+            vec3 c = throughput * Le;
+            if (clampFire && bounce > 0u) c = clampLum(c, 30.0);
+            outp.radiance += c;
+        }
+        if (scatter == fp.maxBounces) break;
+        if (inst.lightIndex >= 0) break;  // les luminaires n'ont pas de réflexion
+
+        // ---- plastique translucide : une partie de la lumière entrante est rediffusée
+        if (isGlass && m.haze > 0.0 && dot(rd, h.Nout) < 0.0 && rngNext(rng) < m.haze) {
+            isGlass = false;
+            s.base = m.hazeColor;
+            s.transmission = 0.0;
+            s.metallic = 0.0;
+        }
+
+        // ---- verre / plastique transparent : Fresnel, interface lisse ou dépolie, absorption
+        if (isGlass) {
+            if (m.absorbDistance > 0.0 && dot(rd, h.Nout) > 0.0)  // sortie : le segment était dans la matière
+                throughput *= beerLambert(m.absorbColor, h.t / m.absorbDistance);
+            vec3 nd;
+            float w;
+            bool refracted;
+            if (!sampleDielectric(rd, h.Nout, s.ior, s.roughness, rng, nd, w, refracted)) break;
+            throughput *= w;
+            if (refracted) throughput *= s.base;
+            ro = offsetRay(h.P, h.Nout, nd);
+            rd = nd;
+            lastDelta = true;
+            continue;
+        }
+        ++scatter;
+
+        const Onb onb = makeOnb(h.N);
+        const vec3 wo = toLocal(onb, -rd);
+        const BsdfLobes lobes = makeLobes(s, max(wo.z, 1e-4));
+
+        // ---- éclairage direct : échantillonnage des luminaires + rayon d'ombre + MIS
+        if (fp.numLights > 0u) {
+            const uint li = min(uint(rngNext(rng) * float(fp.numLights)), fp.numLights - 1u);
+            const RectLight L = lights.l[li];
+            const vec2 u = rngNext2(rng);
+            const vec3 lp = L.corner + L.edgeU * u.x + L.edgeV * u.y;
+            vec3 d = lp - h.P;
+            const float dist2 = dot(d, d);
+            const float dist = sqrt(dist2);
+            d = d * (1.0 / dist);
+            const float cosL = -dot(d, L.normal);
+            const float nol = dot(h.N, d);
+            if (cosL > 0.0 && nol > 0.0 && dot(h.Ng, d) > 0.0) {
+                float pdfB;
+                const vec3 f = evalBsdf(lobes, wo, toLocal(onb, d), pdfB);
+                if (maxComp(f) > 0.0) {
+                    const float pdfL = dist2 / (cosL * L.area * float(fp.numLights));
+                    const vec3 o = offsetRay(h.P, h.Ng, d);
+                    if (!occluded(o, d, dist * 0.999)) {
+                        const float w = pdfL * pdfL / (pdfL * pdfL + pdfB * pdfB);
+                        vec3 c = throughput * f * L.emission * (nol * w / pdfL);
+                        if (clampFire && bounce > 0u) c = clampLum(c, 30.0);
+                        outp.radiance += c;
+                    }
+                }
+            }
+        }
+
+        // ---- rebond indirect
+        vec3 wiL, f;
+        float pdf;
+        if (!sampleBsdf(lobes, wo, rng, wiL, f, pdf)) break;
+        const vec3 wi = toWorld(onb, wiL);
+        if (dot(wi, h.Ng) <= 0.0) break;
+        throughput *= f * (wiL.z / pdf);
+        lastPdf = pdf;
+        lastDelta = false;
+        ro = offsetRay(h.P, h.Ng, wi);
+        rd = wi;
+
+        // roulette russe
+        if (scatter >= 2u) {
+            const float q = max(0.05, 1.0 - maxComp(throughput));
+            if (rngNext(rng) < q) break;
+            throughput = throughput * (1.0 / (1.0 - q));
+        }
+    }
+    return outp;
+}
+
+void main()
+{
+    const uvec2 idx = gl_GlobalInvocationID.xy;
+    if (idx.x >= fp.width || idx.y >= fp.height) return;
+    const uint pixel = idx.y * fp.width + idx.x;
+    Rng rng;
+    rng.s = pcgHash(pixel * 9781u + pcgHash(fp.frameIndex * 6271u + 17u));
+
+    vec3 radiance = vec3(0.0);
+    PathOutput first;
+    const uint spp = max(1u, fp.spp);
+    for (uint s = 0u; s < spp; ++s) {
+        const vec2 j = rngNext2(rng);  // anticrénelage : position aléatoire dans le pixel
+        const PathOutput po = tracePath(vec2(idx) + j, rng, s == 0u);
+        radiance += po.radiance;
+        if (s == 0u) first = po;
+    }
+    radiance = radiance * (1.0 / float(spp));
+    if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);  // garde-fou NaN
+
+    vec4 color = vec4(radiance, 1.0);
+    vec4 albedo = vec4(first.albedo, 1.0);
+    vec4 normal = vec4(first.normal, first.depth);
+    Vec4Buf colorBuf = Vec4Buf(fp.color);
+    Vec4Buf albedoBuf = Vec4Buf(fp.albedo);
+    Vec4Buf normalBuf = Vec4Buf(fp.normal);
+    if ((fp.flags & kFlagAccumulate) != 0u && fp.accumCount > 0u) {
+        const float n = float(fp.accumCount);
+        const float inv = 1.0 / (n + 1.0);
+        color = (colorBuf.v[pixel] * n + color) * inv;
+        albedo = (albedoBuf.v[pixel] * n + albedo) * inv;
+        const vec4 pn = normalBuf.v[pixel];
+        normal = vec4((pn.xyz * n + normal.xyz) * inv, pn.w);  // profondeur : celle du 1er échantillon
+    }
+    colorBuf.v[pixel] = color;
+    albedoBuf.v[pixel] = albedo;
+    normalBuf.v[pixel] = normal;
+    if (fp.motion != 0ul) Vec2RWBuf(fp.motion).v[pixel] = first.motion;
+}
+#endif

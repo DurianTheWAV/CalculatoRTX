@@ -5,14 +5,23 @@
 // Toutes les fonctions sont exécutées sur la carte graphique.
 #pragma once
 
+#if defined(__CUDACC__)
 #include <cuda_runtime.h>
+#endif
+
+#include <math.h>
 
 #include <cmath>
 #include <limits>
 
-// Les fonctions sont compilées pour le GPU (et aussi pour le CPU afin de permettre
-// les tests unitaires hôte, voir tests/CalcHostTest.cu).
+// Les fonctions sont compilées pour le GPU CUDA (et aussi pour le CPU afin de permettre
+// les tests unitaires hôte, voir tests/CalcHostTest.cpp). Le backend Vulkan en utilise un
+// portage GLSL fidèle : src/vk/shaders/Calc.comp.
+#if defined(__CUDACC__)
 #define CRTX_CALC_HD __host__ __device__ inline
+#else
+#define CRTX_CALC_HD inline
+#endif
 
 namespace crtx {
 namespace dd {
@@ -285,6 +294,54 @@ CRTX_CALC_HD DD acosDD(DD x)
     const DD a = asinDD(x);
     if (!isFinite(a)) return a;
     return sub(kPi2(), a);
+}
+
+// ---- fonction Gamma en double-double (~31 chiffres), identique en GLSL (CalcDD.glsl)
+// ln Gamma(z) par la série de Stirling (13 termes de Bernoulli) pour z >= 25.
+CRTX_CALC_HD DD lgammaStirling(DD z)
+{
+    const double num[13] = {1.0, -1.0, 1.0, -1.0, 1.0, -691.0, 1.0, -3617.0, 43867.0, -174611.0, 77683.0,
+                            -236364091.0, 657931.0};
+    const double den[13] = {12.0, 360.0, 1260.0, 1680.0, 1188.0, 360360.0, 156.0, 122400.0, 244188.0, 125400.0,
+                            5796.0, 1506960.0, 300.0};
+    const DD lnz = logDD(z);
+    DD r = sub(mul(sub(z, make(0.5)), lnz), z);
+    r = add(r, mulD(logDD(mulD(kPi(), 2.0)), 0.5));  // + ln(2 pi) / 2
+    const DD z2 = mul(z, z);
+    DD t = div(make(1.0), z);
+    for (int k = 0; k < 13; ++k) {
+        r = add(r, mul(div(make(num[k]), make(den[k])), t));
+        t = div(t, z2);
+    }
+    return r;
+}
+
+// Gamma(x) pour x >= 1/2 : récurrence jusqu'à x + n >= 25, puis Stirling
+CRTX_CALC_HD DD gammaPositive(DD x)
+{
+    DD prod = make(1.0);
+    DD z = x;
+    while (z.hi < 25.0) {
+        prod = mul(prod, z);
+        z = add(z, make(1.0));
+    }
+    const DD g = expDD(lgammaStirling(z));
+    if (!isFinite(g)) return g;
+    return div(g, prod);
+}
+
+// Gamma(x), x non entier négatif ou nul (pôles traités par l'appelant) ; formule des
+// compléments pour x < 1/2 : Gamma(x) = pi / (sin(pi x) Gamma(1 - x)).
+CRTX_CALC_HD DD gammaDD(DD x)
+{
+    if (!isFinite(x)) return make(qnan());
+    if (x.hi >= 0.5) return gammaPositive(x);
+    if (x.hi < -200.0) return make(0.0);
+    const DD g = gammaPositive(sub(make(1.0), x));
+    if (!isFinite(g)) return make(0.0);
+    DD s, c;
+    sinCosDD(mul(kPi(), x), s, c);
+    return div(kPi(), mul(s, g));
 }
 
 }  // namespace dd
