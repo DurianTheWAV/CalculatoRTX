@@ -29,7 +29,7 @@ public:
 
     struct Params {
         float exposure = 1.0f;
-        float bloomStrength = 0.06f;
+        float bloomStrength = 0.08f;
         float bloomThreshold = 1.2f;
         float vignette = 0.22f;
         unsigned frame = 0;

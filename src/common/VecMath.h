@@ -1,8 +1,9 @@
 // CalculatoRTX - mathématiques vectorielles partagées hôte / GPU
 #pragma once
 
-#include <cuda_runtime.h>
-#include <vector_functions.h>
+#include "VectorTypes.h"
+
+#include <math.h>
 
 #include <cmath>
 

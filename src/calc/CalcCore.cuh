@@ -33,19 +33,37 @@ CRTX_CALC_HD double iv_sqrt_rd(double a) { return __dsqrt_rd(a); }
 CRTX_CALC_HD double iv_sqrt_ru(double a) { return __dsqrt_ru(a); }
 CRTX_CALC_HD double ivExp10(double a) { return exp10(a); }
 #else
-// Émulation CPU (tests) : arrondi au plus proche puis élargissement d'un ulp.
+// Émulation CPU (tests) des arrondis dirigés : arrondi au plus proche, puis le signe de
+// l'erreur exacte (TwoSum / TwoProd / reste) indique s'il faut passer au double adjacent.
+// Un résultat exact reste exact, comme avec les instructions matérielles __dadd_rd...
 inline double ivDown(double v) { return std::nextafter(v, -std::numeric_limits<double>::infinity()); }
 inline double ivUp(double v) { return std::nextafter(v, std::numeric_limits<double>::infinity()); }
-inline double iv_add_rd(double a, double b) { return ivDown(a + b); }
-inline double iv_add_ru(double a, double b) { return ivUp(a + b); }
-inline double iv_sub_rd(double a, double b) { return ivDown(a - b); }
-inline double iv_sub_ru(double a, double b) { return ivUp(a - b); }
-inline double iv_mul_rd(double a, double b) { return ivDown(a * b); }
-inline double iv_mul_ru(double a, double b) { return ivUp(a * b); }
-inline double iv_div_rd(double a, double b) { return ivDown(a / b); }
-inline double iv_div_ru(double a, double b) { return ivUp(a / b); }
-inline double iv_sqrt_rd(double a) { return ivDown(std::sqrt(a)); }
-inline double iv_sqrt_ru(double a) { return ivUp(std::sqrt(a)); }
+inline double iv_add_rd(double a, double b) { const dd::DD s = dd::twoSum(a, b); return s.lo < 0.0 ? ivDown(s.hi) : s.hi; }
+inline double iv_add_ru(double a, double b) { const dd::DD s = dd::twoSum(a, b); return s.lo > 0.0 ? ivUp(s.hi) : s.hi; }
+inline double iv_sub_rd(double a, double b) { return iv_add_rd(a, -b); }
+inline double iv_sub_ru(double a, double b) { return iv_add_ru(a, -b); }
+inline double iv_mul_rd(double a, double b) { const dd::DD p = dd::twoProd(a, b); return p.lo < 0.0 ? ivDown(p.hi) : p.hi; }
+inline double iv_mul_ru(double a, double b) { const dd::DD p = dd::twoProd(a, b); return p.lo > 0.0 ? ivUp(p.hi) : p.hi; }
+inline double ivDivRem(double a, double b, double q)  // signe de a/b - q
+{
+    const dd::DD p = dd::twoProd(q, b);
+    const double r = (a - p.hi) - p.lo;
+    return b > 0.0 ? r : -r;
+}
+inline double iv_div_rd(double a, double b) { const double q = a / b; return ivDivRem(a, b, q) < 0.0 ? ivDown(q) : q; }
+inline double iv_div_ru(double a, double b) { const double q = a / b; return ivDivRem(a, b, q) > 0.0 ? ivUp(q) : q; }
+inline double iv_sqrt_rd(double a)
+{
+    const double s = std::sqrt(a);
+    const dd::DD p = dd::twoProd(s, s);
+    return (a - p.hi) - p.lo < 0.0 ? ivDown(s) : s;
+}
+inline double iv_sqrt_ru(double a)
+{
+    const double s = std::sqrt(a);
+    const dd::DD p = dd::twoProd(s, s);
+    return (a - p.hi) - p.lo > 0.0 ? ivUp(s) : s;
+}
 inline double ivExp10(double a) { return std::pow(10.0, a); }
 #endif
 
@@ -436,10 +454,10 @@ struct NumDD {
             for (int k = 2; k <= static_cast<int>(x.hi); ++k) r = dd::mulD(r, static_cast<double>(k));
             return r;
         }
-        // non entier : Gamma(x+1) (précision FP64)
-        const double g = tgamma(approx(x) + 1.0);
-        classify(g, err);
-        return dd::make(g);
+        // non entier : Gamma(x+1) en double-double
+        const T g = dd::gammaDD(dd::add(x, dd::make(1.0)));
+        if (!dd::isFinite(g)) setErr(err, kOverflow);
+        return g;
     }
 
     CRTX_CALC_HD static T unary(char op, T x, int angle, int& err)
@@ -757,8 +775,13 @@ CRTX_CALC_HD int extractDigits(DD a, int sig, char* digits)
     // N = round(a / 10^(e - sig + 1)), entier < 10^sig (exact en DD)
     for (int attempt = 0; attempt < 3; ++attempt) {
         const int shift = e - sig + 1;
-        DD scaled = shift >= 0 ? dd::div(a, dd::powInt(dd::make(10.0), shift))
-                               : dd::mul(a, dd::powInt(dd::make(10.0), -shift));
+        DD scaled;
+        if (shift >= 0) {
+            scaled = dd::div(a, dd::powInt(dd::make(10.0), shift));
+        } else {  // en deux fois : 10^309 dépasserait la plage des doubles (résultats < 1e-299)
+            const int k1 = -shift > 300 ? 300 : -shift;
+            scaled = dd::mul(dd::mul(a, dd::powInt(dd::make(10.0), k1)), dd::powInt(dd::make(10.0), -shift - k1));
+        }
         DD nr = dd::roundDD(scaled);
         double lim = 1.0;
         for (int k = 0; k < sig; ++k) lim *= 10.0;

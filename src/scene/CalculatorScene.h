@@ -9,7 +9,7 @@
 // vers +z) puis inclinée sur sa béquille par la transformation calcToWorld().
 #pragma once
 
-#include "../render/LaunchParams.h"
+#include "../render/SceneTypes.h"
 #include "Keys.h"
 #include "Mesh.h"
 #include "StrokeFont.h"
@@ -77,6 +77,8 @@ class CalculatorScene {
 public:
     explicit CalculatorScene(const StrokeFont& font);
 
+    // Mention verte du bandeau (GPU et technologies, '|' = séparateur) ; avant build().
+    void setBadge(const std::string& text) { badge_ = text; }
     void build();
 
     // ---- état interactif
@@ -116,6 +118,7 @@ private:
     std::vector<Material> materials_;
     std::vector<RectLight> lights_;
     std::vector<KeyDef> keys_;
+    std::string badge_ = "RTX 4060 Ti|OptiX|DLSS|CUDA";
     Affine calcXf_ = affineIdentity();  // repère calculatrice -> monde (inclinaison)
     float3 focus_ = make_float3(0, 0, 0);
 

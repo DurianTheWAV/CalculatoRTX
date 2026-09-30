@@ -1,169 +1,248 @@
 # CalculatoRTX
 
-Calculatrice scientifique **entièrement ray tracée** en CUDA C++ : chaque pixel de l'interface
-(coque translucide et électronique visible au travers, touches, légendes en relief, chiffres de
-l'afficheur, vitre, bureau, arrière-plan)
-est calculé par **path tracing OptiX sur les RT cores**, suréchantillonné par **NVIDIA DLSS**
-(Tensor cores), et **tous les calculs mathématiques sont exécutés sur la carte graphique**.
+A scientific calculator that is **fully ray traced**: every pixel of the interface (translucent
+shell with the electronics visible through it, keys, embossed legends, display digits, glass,
+desk, background) is computed by a **GPU path tracer**, and **all mathematical calculations run
+on the graphics card**.
 
-Compatible **Linux** (CachyOS/Arch, Ubuntu…) et **Windows 10/11**.
+Two rendering back-ends are built from the same scene:
 
-> **État du projet.** Sous Linux (GCC 13, CUDA 13.4, OptiX 9.1 et 9.0, SDK DLSS 310.9.1,
-> Vulkan 1.3, GLFW 3.3), le projet se compile et s'édite de bout en bout sans avertissement, avec
-> et sans DLSS, et les tests unitaires du moteur de calcul passent. **Non testé** : la compilation
-> Windows (MSVC) et l'exécution sur une vraie carte RTX (aucun GPU dans l'environnement de
-> développement). La section [Dépannage](#dépannage) décrit les points à vérifier au premier
-> lancement.
+| Back-end | GPUs | Ray tracing | Upscaling / denoising | Calculator engine |
+|---|---|---|---|---|
+| **NVIDIA** | GeForce RTX (tuned for the **RTX 4060 Ti**) | OptiX 9 on the RT cores, Shader Execution Reordering, Opacity Micromaps | **DLSS** Super Resolution + OptiX AI denoiser (Tensor cores) | CUDA warp |
+| **Vulkan** | **AMD Radeon RX 6000/7000/9000**, Intel Arc, NVIDIA RTX | `VK_KHR_ray_query` in compute shaders (hardware ray accelerators) | temporal accumulation + edge-avoiding à-trous denoiser + **AMD FidelityFX FSR 1** | FP64 compute shader |
 
-![Rendu de référence](docs/apercu-rendu.jpg)
+The NVIDIA back-end is used when an RTX card and the CUDA toolkit are available; otherwise the
+program uses the Vulkan back-end automatically. The CUDA toolkit is **optional** at build time:
+without it, only the Vulkan back-end is compiled (AMD / Intel machines).
 
-*Image de référence calculée **sur CPU** pendant le développement par un portage du path tracer
-de `Programs.cu` (mêmes matériaux, même scène, 320 échantillons par pixel, sans DLSS ni
-débruiteur). Ce n'est pas une capture de l'application : sur la RTX 4070 Ti, la même image est
-produite en temps réel par OptiX, puis débruitée et suréchantillonnée par le DLSS.*
+Runs on **Linux** (CachyOS/Arch, Ubuntu…) and **Windows 10/11**.
+
+> **Project status.** On Linux (GCC 13, CUDA 13.4, OptiX 9.1 and 9.0, DLSS SDK 310.9.1,
+> Vulkan 1.3, GLFW 3.3), both configurations (with and without CUDA) build without warnings, and
+> the test suite passes. The Vulkan back-end has been run end to end on Mesa's software Vulkan
+> driver (*lavapipe*): rendering, picking, FSR 1, temporal accumulation, and 1 500+ random
+> expressions evaluated by the GPU calculator engine and compared with the CPU reference.
+> **Not tested**: the Windows (MSVC) build and execution on real NVIDIA or AMD hardware (there
+> is no GPU in the development environment). See [Troubleshooting](#troubleshooting) for what to
+> check on first launch.
+
+![Rendered preview](docs/preview.jpg)
+
+*Rendered by the program's own Vulkan back-end (`render_vulkan_test`, 1200×750, ~260
+accumulated frames, à-trous denoiser, bloom and ACES tone mapping) on the lavapipe software
+driver during development. It is not a capture from a GPU: on an RTX 4060 Ti the NVIDIA
+back-end produces this image in real time with OptiX and DLSS, and on a Radeon the Vulkan
+back-end produces the same image.*
 
 ---
 
-## Sommaire
+## Contents
 
-1. [Fonctionnalités](#fonctionnalités)
-2. [Utilisation des capacités de la RTX 4070 Ti](#utilisation-des-capacités-de-la-rtx-4070-ti)
-3. [Prérequis](#prérequis)
-4. [Compilation](#compilation)
-5. [Utilisation](#utilisation)
-6. [Architecture](#architecture)
-7. [Dépannage](#dépannage)
-8. [Licences](#licences)
+1. [Features](#features)
+2. [Optimisations for the RTX 4060 Ti](#optimisations-for-the-rtx-4060-ti)
+3. [AMD and Intel GPUs (Vulkan back-end)](#amd-and-intel-gpus-vulkan-back-end)
+4. [Requirements](#requirements)
+5. [Building](#building)
+6. [Usage](#usage)
+7. [Architecture](#architecture)
+8. [Tests](#tests)
+9. [Troubleshooting](#troubleshooting)
+10. [Licences](#licences)
 
 ---
 
-## Fonctionnalités
+## Features
 
-### Interface 100 % ray tracée
+### 100 % ray-traced interface
 
-Il n'y a aucun élément 2D : l'interface est une scène 3D (~105 000 triangles, 118 instances).
+There are no 2D elements: the interface is a 3D scene (~105,000 triangles, 118 instances).
 
-| Élément | Ce que calculent les rayons |
+| Element | What the rays compute |
 |---|---|
-| Pourtour de la coque (flancs, rebords, bandeau du logo) en polycarbonate gris translucide, creux | double réfraction à travers la paroi dépolie (microfacettes GGX), absorption de Beer-Lambert dans l'épaisseur, diffusion laiteuse qui garde la teinte grise |
-| Électronique interne : circuit imprimé (pistes et vias procéduraux), dômes de contact, processeur, quartz, mémoire, composants CMS, condensateurs, nappe Kapton, pile, LED témoin | vue en transparence, légèrement estompée ; éclairée par la lumière qui traverse la coque, ombres comprises |
-| Lit de touches en carbone, cadre de l'afficheur | plaques opaques enchâssées dans la coque : réflexions GGX, ombres douces, éclairage global |
-| Calculatrice inclinée de 15° sur une béquille en aluminium brossé et deux patins | l'écran fait face à l'utilisateur ; toute la scène est posée dans un repère incliné |
-| 40 touches arrondies à face concave | géométrie instanciée, vernis (clear-coat), animation d'appui |
-| Légendes des touches, texte de l'afficheur | **vrais volumes 3D** extrudés à partir d'une police vectorielle (pas de texture) |
-| Afficheur fluorescent (VFD) | chiffres émissifs qui éclairent la scène, sous une **vitre réfractive** (Fresnel exact) |
-| Grille perforée + bande lumineuse verte | trous hexagonaux via **Opacity Micromaps** + programme any-hit |
-| Cellule solaire (étroite, à droite), marquage, bureau en noyer verni | matériaux procéduraux évalués dans le shader |
-| Arrière-plan « studio » | environnement HDR généré sur GPU, échantillonné par les unités de texture |
-| Luminaires (softbox, contre-jour, appoint) | géométrie émissive + échantillonnage direct avec MIS |
-| Survol / clic | **sélection par lancer de rayon** sous le curseur |
+| Shell rim (sides, edges, logo band) in hollow translucent grey polycarbonate | double refraction through the frosted wall (GGX microfacets), Beer-Lambert absorption through the thickness, milky scattering that keeps the grey tint |
+| Internal electronics: printed circuit board (procedural traces and vias), contact domes, processor, crystal, memory, SMD parts, capacitors, Kapton ribbon, battery, indicator LED | seen through the shell, slightly blurred; lit by the light that crosses the shell, shadows included |
+| Carbon key bed, display frame | opaque plates set into the shell: GGX reflections, soft shadows, global illumination |
+| Calculator tilted by 15° on a brushed-aluminium kickstand and two feet | the display faces the user; the whole calculator lives in a tilted frame |
+| 40 rounded keys with concave tops | instanced geometry, clear coat, press animation |
+| Key legends, display text | **real 3D volumes** extruded from a vector stroke font (no textures) |
+| Vacuum fluorescent display (VFD) | emissive digits that light the scene, under a **refractive glass** (exact Fresnel) |
+| Perforated grille + green light strip | hexagonal holes through **Opacity Micromaps** + any-hit program (NVIDIA), or an alpha test on ray-query candidates (Vulkan) |
+| Solar cell (narrow, on the right), branding, varnished walnut desk | procedural materials evaluated in the shader |
+| "Studio" background | HDR environment generated on the GPU |
+| Lights (softbox, rim light, fill light) | emissive geometry + next-event estimation with multiple importance sampling |
+| Hover / click | **ray-cast picking** under the mouse cursor |
 
-Le rendu fait jusqu'à 5 rebonds (réglable), sans compter les traversées de verre et de
-plastique (8 au plus en plus, pour que l'électronique vue à travers la coque reste éclairée),
-avec roulette russe, et fournit au DLSS la
-profondeur et les vecteurs de mouvement (y compris ceux des touches qui s'enfoncent).
+Paths have up to 5 bounces (adjustable), not counting glass and plastic crossings (up to 8
+more, so that the electronics seen through the shell stays lit), with Russian roulette. The path
+tracer also outputs depth and motion vectors (including those of keys being pressed) for DLSS
+and for the temporal accumulation of the Vulkan back-end.
 
-### Calculs sur le GPU
+### Calculations on the GPU
 
-Le CPU ne fait **aucun calcul numérique** : il transmet au GPU l'expression saisie sous forme
-d'octets. Un warp CUDA :
+The CPU does **no numerical computation**: it sends the typed expression to the GPU as bytes.
+A CUDA warp (NVIDIA) or a four-lane compute shader workgroup (Vulkan):
 
-1. analyse l'expression (tokenisation + algorithme *shunting-yard* → notation polonaise inverse),
-   y compris la conversion des nombres décimaux ;
-2. l'évalue **en parallèle dans quatre arithmétiques** : double-double (~31 chiffres
-   significatifs), FP64, FP32 et **arithmétique d'intervalles** FP64 à arrondis dirigés
-   (`__dadd_rd`, `__dmul_ru`…) ;
-3. croise les résultats par échanges intra-warp (`__shfl_sync`) : l'indicateur `DD ✓` de
-   l'afficheur signifie que le résultat double-double est dans l'intervalle garanti et
-   concorde avec FP64 ;
-4. formate le résultat en texte décimal (arrondi correct, notation ×10ⁿ) — toujours sur GPU.
+1. parses the expression (tokenisation + *shunting-yard* → reverse Polish notation), including
+   the conversion of decimal numbers;
+2. evaluates it **in parallel in four arithmetics**: double-double (~31 significant digits), FP64,
+   FP32 and FP64 **interval arithmetic** with directed rounding (`__dadd_rd`, `__dmul_ru`… in
+   CUDA; exactness-aware emulation with error-free transformations in GLSL);
+3. cross-checks the results between lanes: the `DD ✓` indicator on the display means that the
+   double-double result lies inside the guaranteed interval and agrees with FP64;
+4. formats the result as decimal text (correct rounding, ×10ⁿ notation) — still on the GPU.
 
-Fonctions : `+ − × ÷`, puissance, racine n-ième, `√ ∛ x² x³ x⁻¹ n!`, `sin cos tan` et leurs
-réciproques (degrés/radians, valeurs exactes aux angles remarquables), `ln log eˣ 10ˣ`, `π e`,
-parenthèses, multiplication implicite (`2π`, `3(4+5)`), notation `EXP`, `ANS`, mémoire
-`MC MR M+ M−` (l'addition mémoire est elle aussi faite par le GPU), **aperçu du résultat en
-direct** pendant la saisie. Le calcul tourne sur un flux CUDA **haute priorité**, prioritaire
-sur le rendu.
+Functions: `+ − × ÷`, power, n-th root, `√ ∛ x² x³ x⁻¹ n!` (Γ function for non-integers),
+`sin cos tan` and their inverses (degrees/radians, exact values at notable angles),
+`ln log eˣ 10ˣ`, `π e`, parentheses, implicit multiplication (`2π`, `3(4+5)`), `EXP` notation,
+`ANS`, memory `MC MR M+ M−` (the memory addition is also done by the GPU), and a **live preview
+of the result** while typing. On NVIDIA the calculation runs on a **high-priority CUDA stream**
+that takes precedence over rendering.
 
 ---
 
-## Utilisation des capacités de la RTX 4070 Ti
+## Optimisations for the RTX 4060 Ti
 
-La RTX 4070 Ti (puce AD104, architecture Ada Lovelace, `sm_89`) est exploitée ainsi :
+The RTX 4060 Ti (AD106 chip, Ada Lovelace, `sm_89`: 34 SMs, 34 third-generation RT cores,
+136 fourth-generation Tensor cores, 32 MB of L2 cache, 128-bit memory bus) has a little under
+60 % of the ray-tracing throughput of an RTX 4070 Ti and a narrower memory bus, so the renderer avoids doing
+work it does not need:
 
-| Capacité matérielle | Utilisation dans CalculatoRTX | Fichier |
+| Technique | Effect | File |
 |---|---|---|
-| **RT cores 3ᵉ génération** | traversée BVH et intersections triangles de tous les rayons (OptiX 9) | `src/render/device/Programs.cu` |
-| **Shader Execution Reordering** (Ada) | `optixTraverse` + `optixReorder` : regroupement des threads par matériau avant le shading | `Programs.cu` |
-| **Opacity Micromaps** (Ada) | grille perforée : 512 triangles × 1 024 micro-triangles classés sur l'hôte, any-hit seulement pour les zones indéterminées | `OptixRenderer.cpp`, `Grille.h` |
-| **Tensor cores 4ᵉ génération** | DLSS Super Resolution (modèle Transformer, presets DLSS 4) + débruiteur IA OptiX | `src/dlss/`, `OptixRenderer.cpp` |
-| **Instancing matériel** (IAS/GAS) | un seul maillage de touche instancié 40 fois, compaction des BVH | `OptixRenderer.cpp` |
-| **CUDA cores / FP32** | shading, bruit procédural, post-traitement (bloom, ACES, tramage) | `Kernels.cu` |
-| **Unités FP64 + FMA** | arithmétique double-double et intervalles à arrondis dirigés | `src/calc/` |
-| **Warps / groupes coopératifs** | analyse + 4 évaluations concurrentes + réduction par `shfl` | `CalcEngine.cu` |
-| **Cache L2 de 48 Mo** | fenêtre d'accès « persistante » sur les images produites par le path tracer et relues par le débruiteur | `OptixRenderer.cpp` |
-| **CUDA Graphs** | chaîne de post-traitement capturée une fois, rejouée à chaque image | `Kernels.cu` |
-| **Priorités de flux** | calculs de la calculatrice sur un flux prioritaire | `CalcEngine.cu` |
-| **Unités de texture** | environnement HDR en `cudaArray` avec filtrage bilinéaire matériel | `OptixRenderer.cpp` |
-| **FP16** | tampons RGBA16F d'entrée/sortie du DLSS | `Kernels.cu` |
-| **Interopérabilité CUDA ↔ Vulkan** | mémoire externe partagée (zéro copie) + sémaphore *timeline* exporté | `src/gpu/VulkanContext.cpp` |
+| **Hybrid progressive rendering** | while the camera, a key or the display changes, frames are rendered at reduced resolution and reconstructed by DLSS; as soon as the image is still, samples accumulate at **native resolution** and replace the DLSS image after 4 frames | `src/backends/NvidiaBackend.cpp` |
+| **Automatic DLSS mode** by display size and SM count | 34 SMs: Quality up to 1080p, Balanced at 1440p, Performance at 4K (one step better from 56 SMs, one step worse below 30) | `NvidiaBackend.cpp` |
+| **Adaptive samples per pixel** when still | the sample count per frame is adjusted to keep the path-tracing time around 12 ms | `NvidiaBackend.cpp` |
+| **Stop when converged** | after 1,024 samples per pixel the GPU stops ray tracing (only the picking ray is cast) and the application waits for input events instead of spinning: zero GPU load on an idle calculator | `NvidiaBackend.cpp`, `src/app/App.cpp` |
+| **AI denoiser skipped** once enough samples are accumulated (≥ 256 spp) | saves Tensor-core time and avoids over-smoothing the converged image | `src/render/OptixRenderer.cpp` |
+| **Persistent L2 window** sized from the actual L2 (32 MB on AD106) | the path-tracer outputs read back by the denoiser stay in L2, which compensates for the 128-bit bus | `OptixRenderer.cpp` |
+| **Separate motion/still targets** | each target has its own buffers and denoiser state: switching between DLSS and native accumulation does not reallocate anything | `OptixRenderer.cpp` |
 
-**Ce qui n'est pas utilisé, et pourquoi** (utiliser « toutes » les fonctions d'une carte n'a pas
-de sens pour chacune d'elles) :
+It also uses the rest of the Ada feature set:
 
-- **DLSS Frame Generation** (accélérateur de flux optique) : nécessite le SDK Streamline + Reflex,
-  uniquement sous Windows ; il n'existe pas de chemin CUDA/Vulkan Linux.
-- **DLSS Ray Reconstruction** : possible évolution ; ici le débruitage est fait par le débruiteur
-  IA d'OptiX (également sur Tensor cores) avant la super-résolution DLSS.
-- **Displaced Micro-Meshes** : la géométrie (touches arrondies) est générée analytiquement avec
-  une densité suffisante, il n'y a pas de surface déplacée à encoder.
-- **NVENC / NVDEC** (encodage vidéo AV1) : sans rapport avec une calculatrice.
+| Hardware feature | Use in CalculatoRTX | File |
+|---|---|---|
+| **3rd-gen RT cores** | BVH traversal and ray/triangle intersection of all rays (OptiX 9) | `src/render/device/Programs.cu` |
+| **Shader Execution Reordering** (Ada) | `optixTraverse` + `optixReorder`: threads are regrouped by material before shading | `Programs.cu` |
+| **Opacity Micromaps** (Ada) | perforated grille: 512 triangles × 1,024 micro-triangles classified on the host, any-hit only in undetermined areas | `OptixRenderer.cpp`, `Grille.h` |
+| **4th-gen Tensor cores** | DLSS Super Resolution (Transformer model, DLSS 4 presets) + OptiX AI denoiser | `src/dlss/`, `OptixRenderer.cpp` |
+| **Hardware instancing** (IAS/GAS) | a single key mesh instanced 40 times, compacted BVHs | `OptixRenderer.cpp` |
+| **CUDA cores / FP32** | shading, procedural noise, post-processing (bloom, ACES, dithering) | `Kernels.cu` |
+| **FP64 units + FMA** | double-double arithmetic and directed-rounding intervals | `src/calc/` |
+| **Warps / cooperative groups** | parsing + 4 concurrent evaluations + `shfl` reduction | `CalcEngine.cu` |
+| **CUDA Graphs** | post-processing chain captured once, replayed every frame | `Kernels.cu` |
+| **Stream priorities** | calculator work on a high-priority stream | `CalcEngine.cu` |
+| **Texture units** | HDR environment in a `cudaArray` with hardware bilinear filtering | `OptixRenderer.cpp` |
+| **FP16** | RGBA16F DLSS input/output buffers | `Kernels.cu` |
+| **CUDA ↔ Vulkan interop** | shared external memory (zero copy) + exported timeline semaphore | `src/gpu/VulkanContext.cpp` |
+
+**Not used, and why** (using "every" feature of a card makes no sense for each of them):
+
+- **DLSS Frame Generation** (optical flow accelerator): requires the Streamline SDK + Reflex, on
+  Windows only; there is no CUDA/Vulkan path on Linux. It would also add latency to a UI.
+- **DLSS Ray Reconstruction**: a possible evolution; here denoising is done by the OptiX AI
+  denoiser (also on Tensor cores) before DLSS super resolution.
+- **Displaced Micro-Meshes**: the geometry (rounded keys) is generated analytically with enough
+  density; there is no displaced surface to encode.
+- **NVENC / NVDEC** (AV1 video encoding): unrelated to a calculator.
+
+The build targets `sm_89` by default, so it also runs unchanged on every RTX 40 card; see
+`CMAKE_CUDA_ARCHITECTURES` / `CRTX_PTX_ARCH` below for RTX 20/30.
 
 ---
 
-## Prérequis
+## AMD and Intel GPUs (Vulkan back-end)
 
-### Matériel et pilote
+The Vulkan back-end is a port of the same path tracer, materials and calculator engine to GLSL
+compute shaders, so the picture and the results are the same as on NVIDIA:
 
-- GPU NVIDIA **RTX** (conçu et optimisé pour la RTX 4070 Ti ; fonctionne sur toute RTX 20/30/40/50,
-  SER et OMM étant accélérés à partir des RTX 40).
-- **Pilote NVIDIA récent** : il doit supporter la version du CUDA Toolkit utilisée (voir
-  `nvidia-smi`, ligne « CUDA Version ») et OptiX 9.1. Le pilote fournit aussi OptiX
-  (`libnvoptix` / `nvoptix.dll`) et le cœur NGX du DLSS.
+| Stage | Implementation | File |
+|---|---|---|
+| Acceleration structures | one BLAS per mesh (batched builds, rebuilt only when a mesh changes), TLAS rebuilt every frame for the key animations | `src/vk/VkRenderer.cpp` |
+| Path tracing | inline ray tracing (`rayQueryEXT`) in a compute shader, buffer device addresses, scalar block layout | `src/vk/shaders/PathTrace.comp` |
+| Picking | the same shader compiled with `CRTX_PICK`, one ray under the cursor | `PathTrace.comp` |
+| Temporal accumulation (motion) | reprojection with motion vectors, depth disocclusion test, 3×3 neighbourhood clamp, up to 10 frames | `Temporal.comp` |
+| Denoising | edge-avoiding à-trous wavelet filter guided by albedo, normal and depth; fewer passes as samples accumulate | `Denoise.comp` |
+| Post-processing | bloom, exposure, vignette, ACES, sRGB, dithering | `Bloom.comp`, `Composite.comp`, `Pack.comp` |
+| Upscaling (motion) | **AMD FidelityFX FSR 1** EASU + RCAS (MIT, vendored in `third_party/fsr1`) | `Fsr.comp` |
+| Calculator | FP64 compute shader (double-double, FP64, FP32, intervals on four lanes) | `Calc.comp`, `CalcDD.glsl` |
+
+The same hybrid strategy as on NVIDIA is used: reduced resolution + temporal accumulation +
+FSR 1 while moving (Quality ×1.5 up to 1080p, Balanced ×1.7 at 1440p, Performance ×2 at 4K),
+native progressive accumulation when still, adaptive samples per pixel, and no GPU work once
+the image has converged.
+
+Requirements: Vulkan 1.2 with `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`,
+`bufferDeviceAddress`, `scalarBlockLayout` and `shaderInt64`.
+
+- **AMD**: Radeon RX 6000 (RDNA 2) or newer, with Mesa RADV (Linux, package `vulkan-radeon`),
+  AMDVLK, or the AMD Adrenalin driver (Windows). Older Radeon cards only work if the driver
+  exposes `VK_KHR_ray_query` (ray-tracing emulation), and slowly.
+- **Intel**: Arc GPUs. They have no FP64 (`shaderFloat64`), so the calculator engine
+  automatically falls back to the CPU (status shows `CPU` instead of `VK`); rendering stays on
+  the GPU.
+- **NVIDIA**: the Vulkan back-end also runs on RTX cards (`--backend=vulkan`), which is useful
+  for comparison or when the CUDA toolkit is not installed.
+
+---
+
+## Requirements
+
+### Hardware and driver
+
+- **NVIDIA back-end**: GeForce **RTX** GPU (tuned for the RTX 4060 Ti; runs on any RTX
+  20/30/40/50, SER and OMM being hardware-accelerated from the RTX 40 series) and a **recent
+  NVIDIA driver** that supports the CUDA toolkit version in use (see `nvidia-smi`, "CUDA
+  Version" line) and OptiX 9.1. The driver also provides OptiX (`libnvoptix` / `nvoptix.dll`)
+  and the NGX core of DLSS.
+- **Vulkan back-end**: see [AMD and Intel GPUs](#amd-and-intel-gpus-vulkan-back-end).
 
 ### CachyOS / Arch Linux
 
 ```bash
 ./scripts/install_deps_cachyos.sh
-# équivalent à :
-sudo pacman -S --needed base-devel git cmake ninja cuda vulkan-headers vulkan-icd-loader vulkan-tools glfw
 ```
 
-Rechargez ensuite le shell (le paquet `cuda` ajoute `/opt/cuda/bin` au `PATH` via
-`/etc/profile.d/cuda.sh`).
+The script detects the GPUs present and installs:
+
+```bash
+# all machines
+sudo pacman -S --needed base-devel git cmake ninja glfw glslang vulkan-headers vulkan-icd-loader vulkan-tools
+# + NVIDIA: cuda          + AMD: vulkan-radeon          + Intel: vulkan-intel
+```
+
+(`--cuda` / `--no-cuda` force the choice.) With CUDA, reload your shell afterwards (the `cuda`
+package adds `/opt/cuda/bin` to `PATH` through `/etc/profile.d/cuda.sh`).
+
+On Ubuntu/Debian the equivalent packages are `build-essential cmake ninja-build libglfw3-dev
+glslang-tools libvulkan-dev vulkan-tools mesa-vulkan-drivers` (+ the CUDA toolkit for NVIDIA).
 
 ### Windows 10/11
 
-- Visual Studio 2022 avec la charge de travail « Développement Desktop en C++ »
-- CUDA Toolkit 12.4 ou plus récent (13.x recommandé)
-- SDK Vulkan LunarG (<https://vulkan.lunarg.com/>)
-- CMake 3.24+ et Git
+- Visual Studio 2022 with the "Desktop development with C++" workload
+- LunarG Vulkan SDK (<https://vulkan.lunarg.com/>) — provides the headers, the loader and
+  `glslangValidator`
+- CMake 3.24+ and Git
+- NVIDIA only: CUDA Toolkit 12.4 or newer (13.x recommended). Without it, only the Vulkan
+  back-end is built.
 
-### Dépendances téléchargées automatiquement
+### Automatically downloaded dependencies
 
-Au premier `cmake` (connexion Internet requise), si elles ne sont pas déjà installées :
+On the first `cmake` run (Internet access required), if they are not already installed:
 
-| Dépendance | Source | Remarque |
+| Dependency | Source | Notes |
 |---|---|---|
-| En-têtes OptiX 9.1 | `github.com/NVIDIA/optix-dev` (tag `v9.1.0`) | la bibliothèque OptiX elle-même est dans le pilote |
-| SDK DLSS 310.9.1 | `github.com/NVIDIA/DLSS` (tag `v310.9.1`) | quelques centaines de Mo ; la bibliothèque d'exécution est copiée à côté de l'exécutable |
-| GLFW 3.4 | `github.com/glfw/glfw` | seulement si GLFW n'est pas installé |
+| OptiX 9.1 headers | `github.com/NVIDIA/optix-dev` (tag `v9.1.0`) | NVIDIA back-end only; the OptiX library itself ships with the driver |
+| DLSS SDK 310.9.1 | `github.com/NVIDIA/DLSS` (tag `v310.9.1`) | NVIDIA back-end only; a few hundred MB; the runtime library is copied next to the executable |
+| GLFW 3.4 | `github.com/glfw/glfw` | only if GLFW is not installed |
+
+AMD FSR 1 is vendored in `third_party/fsr1` (no download).
 
 ---
 
-## Compilation
+## Building
 
-### CachyOS / Linux (recommandé)
+### CachyOS / Linux (recommended)
 
 ```bash
 git clone https://github.com/DurianTheWAV/CalculatoRTX.git
@@ -172,192 +251,266 @@ cd CalculatoRTX
 ./build/linux-release/bin/CalculatoRTX
 ```
 
-Le script trouve `nvcc` (`/opt/cuda`), choisit le compilateur hôte compatible fourni par le
-paquet `cuda` (Arch livre souvent un GCC plus récent que ce que `nvcc` accepte), configure,
-compile et lance les tests.
+The script finds `nvcc` (`/opt/cuda`) if it is installed and picks the compatible host compiler
+shipped with the `cuda` package (Arch often ships a newer GCC than `nvcc` accepts); without
+`nvcc` it builds the Vulkan back-end only. It then configures, builds and runs the tests.
 
-Équivalent manuel :
+Manual equivalent:
 
 ```bash
-cmake --preset linux-release          # ou : cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --preset linux-release     # NVIDIA + Vulkan back-ends if CUDA is found, Vulkan only otherwise
 cmake --build --preset linux-release
 ctest --preset linux-release
+
+cmake --preset linux-vulkan      # Vulkan back-end only (AMD / Intel), never looks for CUDA
+cmake --build --preset linux-vulkan
 ```
 
 ### Windows
 
 ```bat
 scripts\build_windows.bat
-build\windows\bin\Release\CalculatoRTX.exe
+build\windows-release\bin\Release\CalculatoRTX.exe     (with the CUDA toolkit)
+build\windows-vulkan\bin\Release\CalculatoRTX.exe      (without CUDA: AMD / Intel)
 ```
 
-ou ouvrez le dossier dans Visual Studio 2022 (support CMake intégré, preset `windows-release`).
+or open the folder in Visual Studio 2022 (built-in CMake support, presets `windows-release` and
+`windows-vulkan`).
 
-### Options CMake
+### CMake options
 
-| Option | Défaut | Rôle |
+| Option | Default | Purpose |
 |---|---|---|
-| `CRTX_ENABLE_DLSS` | `ON` | intègre DLSS (sinon : rendu natif + accumulation + débruiteur IA) |
-| `DLSS_SDK_DIR` | vide | SDK DLSS déjà téléchargé (évite le téléchargement) |
-| `OptiX_INSTALL_DIR` | vide | SDK OptiX installé (8.0 minimum) ; sinon en-têtes officiels téléchargés |
-| `CRTX_OPTIX_GIT_TAG` | `v9.1.0` | version des en-têtes OptiX téléchargés (`v9.0.0` pour un pilote plus ancien) |
-| `CMAKE_CUDA_ARCHITECTURES` | `89` | code machine généré (89 = Ada / RTX 40 ; `86;89` pour ajouter les RTX 30) |
-| `CRTX_PTX_ARCH` | `89` | architecture du PTX OptiX (`75` pour supporter aussi les RTX 20/30) |
-| `CRTX_DLSS_DEV_RUNTIME` | `OFF` | bibliothèque DLSS de développement (surimpression de débogage) |
-| `CRTX_BUILD_TESTS` | `ON` | tests CPU du moteur de calcul |
-| `CRTX_FETCH_DEPS` | `ON` | autorise les téléchargements automatiques |
+| `CRTX_ENABLE_CUDA` | `AUTO` | NVIDIA back-end: `AUTO` (if `nvcc` is found), `ON` (required) or `OFF` (Vulkan only) |
+| `CRTX_ENABLE_DLSS` | `ON` | integrate DLSS in the NVIDIA back-end (otherwise native rendering + accumulation + AI denoiser) |
+| `DLSS_SDK_DIR` | empty | an already downloaded DLSS SDK (skips the download) |
+| `OptiX_INSTALL_DIR` | empty | an installed OptiX SDK (8.0 minimum); otherwise the official headers are downloaded |
+| `CRTX_OPTIX_GIT_TAG` | `v9.1.0` | version of the downloaded OptiX headers (`v9.0.0` for an older driver) |
+| `CMAKE_CUDA_ARCHITECTURES` | `89` | generated machine code (89 = Ada / RTX 40; `86;89` to add RTX 30) |
+| `CRTX_PTX_ARCH` | `89` | OptiX PTX architecture (`75` to also support RTX 20/30) |
+| `CRTX_DLSS_DEV_RUNTIME` | `OFF` | development DLSS library (debug overlay) |
+| `CRTX_BUILD_TESTS` | `ON` | calculator and rendering tests |
+| `CRTX_FETCH_DEPS` | `ON` | allow automatic downloads |
 
 ---
 
-## Utilisation
+## Usage
 
-### Souris
+### Mouse
 
-| Action | Effet |
+| Action | Effect |
 |---|---|
-| clic gauche sur une touche | appui (touche détectée par un rayon lancé sous le curseur) |
-| glisser (clic gauche hors touche, droit ou milieu) | faire tourner la vue |
-| molette | zoom |
-| `Origine` (Home) | recentrer la caméra |
+| left click on a key | press it (the key is found by a ray cast under the cursor) |
+| drag (left button outside a key, right or middle button) | rotate the view |
+| wheel | zoom |
+| `Home` | reset the camera |
 
-### Clavier
+### Keyboard
 
-| Touche | Fonction | Touche | Fonction |
+| Key | Function | Key | Function |
 |---|---|---|---|
-| `0`–`9` `.` | chiffres | `+ - * / ^` | opérateurs |
-| `(` `)` | parenthèses | `!` | factorielle |
-| `Entrée` / `=` | calculer | `Retour arrière` | effacer |
-| `Échap` / `Suppr` | AC | `Tab` | 2nd |
+| `0`–`9` `.` | digits | `+ - * / ^` | operators |
+| `(` `)` | parentheses | `!` | factorial |
+| `Enter` / `=` | evaluate | `Backspace` | delete |
+| `Esc` / `Del` | AC | `Tab` | 2nd |
 | `s` `c` `t` | sin cos tan | `l` `g` | ln log |
-| `r` | racine | `q` | x² |
+| `r` | root | `q` | x² |
 | `i` | x⁻¹ | `p` `e` | π, e |
 | `E` | EXP | `a` | ANS |
 | `n` | ± | `d` | DEG/RAD |
-| `m` / `M` | MR / M+ | `F1` | aide |
+| `m` / `M` | MR / M+ | `F1` | help |
 
-| Touche | Réglage de rendu |
+| Key | Rendering setting |
 |---|---|
-| `F2` | DLSS activé / désactivé |
-| `F3` | mode DLSS : DLAA → Qualité → Équilibré → Performance → Ultra Performance |
-| `F4` | débruiteur IA OptiX |
-| `F5` | Shader Execution Reordering (comparer les performances) |
+| `F2` | upscaling while moving (DLSS or FSR 1) on / off |
+| `F3` | upscaling mode: Auto → Native (DLAA) → Quality → Balanced → Performance → Ultra Performance |
+| `F4` | denoiser (OptiX AI or à-trous) |
+| `F5` | Shader Execution Reordering (NVIDIA; to compare performance) |
 | `F6` | V-Sync |
-| `F7` / `F8` | rebonds max (2/3/5/8) / échantillons par pixel (1/2/4) |
-| `F9` / `F10` | exposition − / + |
+| `F7` / `F8` | max bounces (2/3/5/8) / samples per pixel while moving (1/2/4) |
+| `F9` / `F10` | exposure − / + |
+| `F12` | screenshot (`CalculatoRTX_capture_NNN.bmp` in the working directory) |
 
-La barre de titre affiche le mode, la résolution de rendu et d'affichage, les images/s et les
-temps GPU du path tracing et du débruiteur. La console affiche le détail de chaque calcul GPU
-(double-double, FP64, FP32, intervalle, temps en µs).
+The title bar shows the GPU, the back-end and upscaler, the render and display resolutions, the
+frame rate, what the last frame did (upscaled motion frame, accumulation, converged), GPU times
+and the number of accumulated samples. The console prints the details of each GPU calculation
+(double-double, FP64, FP32, interval, time in µs).
 
-### Ligne de commande
+### Command line
 
 ```
-CalculatoRTX [--no-dlss] [--dlss-mode=dlaa|quality|balanced|performance|ultra]
+CalculatoRTX [--backend=auto|nvidia|vulkan] [--no-upscale]
+             [--upscale-mode=auto|native|quality|balanced|performance|ultra]
              [--size=1600x1000] [--no-vsync] [--device=0] [--validation]
+             [--type="<keys>"] [--screenshot=file.bmp] [--frames=120]
 ```
+
+- `--backend=vulkan` forces the Vulkan back-end, even on an NVIDIA card.
+- `--no-dlss` and `--dlss-mode=` are still accepted as aliases.
+- `--type` types keys at start-up (same letters as the keyboard, e.g. `--type="7*6="`);
+  with `--screenshot`, the program saves a capture after `--frames` frames and exits.
 
 ---
 
 ## Architecture
 
-### Déroulement d'une image
+### Frame flow (NVIDIA back-end)
 
 ```
-            CPU                       CUDA (flux de rendu)                    Vulkan (file graphique)
+            CPU                        CUDA (render stream)                    Vulkan (graphics queue)
  ┌──────────────────────┐  ┌──────────────────────────────────────┐  ┌──────────────────────────────┐
- │ saisie → programme   │  │ reconstruction BVH (texte modifié)   │  │                              │
- │ calcul GPU (flux     │  │ IAS (animations des touches)         │  │                              │
- │ haute priorité)      │  │ OptiX : path tracing + SER + OMM     │  │                              │
- │ animation, caméra    │  │ OptiX : rayon de sélection (souris)  │  │                              │
- │                      │  │ débruiteur IA (Tensor cores)         │  │                              │
- │                      │  │ couleur→RGBA16F, profondeur, vecteurs│  │                              │
- │                      │  │ ── signal timeline (n+1) ──────────► │  │ copies tampons → images      │
+ │ input → program      │  │ BVH rebuild (text changed)           │  │                              │
+ │ GPU calculation      │  │ IAS (key animations)                 │  │                              │
+ │ (high-priority       │  │ OptiX: path tracing + SER + OMM      │  │                              │
+ │ stream)              │  │ OptiX: picking ray (mouse)           │  │                              │
+ │ animation, camera    │  │ AI denoiser (Tensor cores)           │  │                              │
+ │ motion or still?     │  │ colour→RGBA16F, depth, motion vectors│  │                              │
+ │                      │  │ ── signal timeline (n+1) ──────────► │  │ buffer → image copies        │
  │                      │  │                                      │  │ DLSS Super Resolution (NGX)  │
- │                      │  │ ◄───────── attente timeline (n+2) ── │  │ copie image → tampon partagé │
- │                      │  │ post-traitement (CUDA Graph) :       │  │                              │
- │                      │  │ bloom, ACES, vignettage, sRGB        │  │                              │
- │                      │  │ ── signal timeline (n+3) ──────────► │  │ copie → swapchain, présente  │
+ │                      │  │ ◄────────── wait timeline (n+2) ──── │  │ image → shared buffer copy   │
+ │                      │  │ post-processing (CUDA Graph):        │  │                              │
+ │                      │  │ bloom, ACES, vignette, sRGB          │  │                              │
+ │                      │  │ ── signal timeline (n+3) ──────────► │  │ copy → swapchain, present    │
  └──────────────────────┘  └──────────────────────────────────────┘  └──── signal timeline (n+4) ───┘
 ```
 
-Vulkan ne dessine rien : il sert uniquement à présenter l'image et à fournir au DLSS les
-ressources Vulkan qu'il exige (le chemin DLSS officiel est D3D11/D3D12/Vulkan). Les images
-circulent sans copie par le CPU grâce à la mémoire externe partagée entre CUDA et Vulkan.
+In the NVIDIA back-end Vulkan draws nothing: it only presents the image and gives DLSS the
+Vulkan resources it requires (the official DLSS path is D3D11/D3D12/Vulkan). Images never go
+through the CPU thanks to external memory shared between CUDA and Vulkan. Still frames skip the
+DLSS stage (native accumulation), and converged frames skip everything but the picking ray.
 
-Sans DLSS (GPU non RTX, SDK absent, `F2`), l'image est rendue en résolution native avec
-accumulation progressive des échantillons (anticrénelage par jitter aléatoire) puis débruitée.
-
-### Arborescence
+### Frame flow (Vulkan back-end)
 
 ```
-CMakeLists.txt, CMakePresets.json   build multiplateforme (téléchargement des dépendances)
-cmake/EmbedFile.cmake               intègre le PTX OptiX dans l'exécutable
-scripts/                            installation / compilation CachyOS et Windows
-src/main.cpp                        point d'entrée, options de ligne de commande
-src/app/App.*                       fenêtre, boucle de rendu, synchronisation CUDA↔Vulkan, entrées
-src/app/CalculatorController.*      logique de saisie (texte uniquement, aucun calcul CPU)
-src/calc/DoubleDouble.cuh           arithmétique double-double (exp, log, trigo, racines…)
-src/calc/CalcCore.cuh               analyseur, 4 arithmétiques, formatage décimal (GPU + tests CPU)
-src/calc/CalcEngine.cu              kernel warp + interface hôte
-src/render/device/Programs.cu       programmes OptiX : raygen (path tracer SER), pick, any-hit
-src/render/device/Shading.cuh       BSDF (Lambert + GGX + vernis), diélectrique dépoli, Fresnel, motifs procéduraux
-src/render/OptixRenderer.*          pipeline, SBT, GAS/IAS, OMM, débruiteur IA, cache L2
-src/render/Kernels.*                environnement HDR, conversion FP16, post-traitement (CUDA Graph)
-src/render/Grille.h                 fonction de distance des trous (OMM + any-hit)
-src/scene/StrokeFont.*              police vectorielle (glyphes en traits)
-src/scene/Mesh.*                    maillages procéduraux : pavés arrondis, texte extrudé, grilles
-src/scene/CalculatorScene.*         calculatrice complète : coque, électronique, béquille, touches, afficheur, matériaux, lumières
-src/gpu/VulkanContext.*             instance, périphérique, swapchain, mémoire/sémaphores exportés
-src/dlss/DlssUpscaler.*             intégration NGX DLSS (repli automatique si indisponible)
-tests/CalcHostTest.cu               tests du moteur de calcul exécutés sur CPU
+ syncScene (BLAS for changed meshes, TLAS) → path tracing (ray query) → picking ray
+   → [moving] temporal accumulation → à-trous denoiser → bloom → composite (ACES, sRGB)
+   → [moving] FSR 1 EASU + RCAS → pack (dither, BGRA) → copy to swapchain → present
+```
+
+All stages are compute shaders recorded in a single command buffer; a timeline semaphore paces
+the CPU.
+
+### Source tree
+
+```
+CMakeLists.txt, CMakePresets.json   cross-platform build (optional CUDA, dependency download, SPIR-V embedding)
+cmake/EmbedFile.cmake               embeds the OptiX PTX and the SPIR-V shaders in the executable
+scripts/                            dependency install / build scripts for CachyOS and Windows
+third_party/fsr1/                   AMD FidelityFX FSR 1 headers (MIT)
+src/main.cpp                        entry point, command-line options
+src/app/App.*                       window, main loop, back-end selection, input, idle waiting
+src/app/CalculatorController.*      input logic (text only, no CPU calculation)
+src/app/Screenshot.*                BMP writer (F12, --screenshot)
+src/backends/Backend.h              back-end interface, render/post settings, upscaling modes
+src/backends/NvidiaBackend.*        CUDA + OptiX + DLSS back-end (hybrid DLSS / native accumulation)
+src/backends/VulkanBackend.*        Vulkan ray-query + FSR 1 back-end (CPU calculator fallback)
+src/calc/DoubleDouble.cuh           double-double arithmetic (exp, log, trig, roots, gamma…)
+src/calc/CalcCore.cuh               parser, 4 arithmetics, decimal formatting (GPU + CPU tests)
+src/calc/CalcEngine.cu              CUDA warp kernel + host interface
+src/calc/ICalcEngine.h              calculator engine interface (CUDA, Vulkan, CPU)
+src/render/device/Programs.cu       OptiX programs: raygen (SER path tracer), pick, any-hit
+src/render/device/Shading.cuh       BSDF (Lambert + GGX + clear coat), rough dielectric, Fresnel, procedural patterns
+src/render/OptixRenderer.*          pipeline, SBT, GAS/IAS, OMM, AI denoiser, L2 persistence, motion/still targets
+src/render/Kernels.*                HDR environment, FP16 conversion, post-processing (CUDA Graph)
+src/render/SceneTypes.h             materials, instances, lights, camera (shared by CUDA and GLSL)
+src/render/Grille.h                 signed distance of the grille holes (OMM + any-hit)
+src/vk/VkRenderer.*                 Vulkan acceleration structures and compute pipeline chain
+src/vk/VkCalcEngine.*               FP64 compute-shader calculator engine
+src/vk/shaders/                     GLSL: path tracer, shading, temporal, denoiser, bloom, composite, FSR 1, calculator
+src/scene/StrokeFont.*              vector font (stroke glyphs)
+src/scene/Mesh.*                    procedural meshes: rounded boxes, extruded text, grilles
+src/scene/CalculatorScene.*         the whole calculator: shell, electronics, kickstand, keys, display, materials, lights
+src/gpu/VulkanContext.*             instance, device, swapchain, ray-tracing features, exported memory/semaphores
+src/dlss/DlssUpscaler.*             NGX DLSS integration (automatic fallback if unavailable)
+tests/                              calculator tests (CPU and Vulkan GPU), off-screen Vulkan rendering test
 ```
 
 ---
 
-## Dépannage
+## Tests
 
-**`nvcc` refuse le compilateur (« unsupported GNU version »)** — Arch/CachyOS livrent souvent un
-GCC plus récent que celui supporté par `nvcc`. Le paquet `cuda` fournit la bonne version :
+`ctest` runs:
+
+| Test | What it checks |
+|---|---|
+| `calc_host_test` | the calculator core on the CPU: formatting, exact values, errors, intervals |
+| `calc_vulkan_test` | the Vulkan compute-shader engine against the CPU reference on 1,500 random expressions (skipped without an FP64 Vulkan GPU) |
+| `render_vulkan_test` | an off-screen frame of the Vulkan back-end (neither black, saturated nor uniform; skipped without a ray-tracing GPU) |
+
+Both Vulkan tests also run without a GPU on Mesa's software driver, which supports ray queries
+and FP64:
 
 ```bash
-export CUDAHOSTCXX=/usr/bin/g++-14     # adaptez au GCC installé par le paquet cuda
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ctest --test-dir build/linux-release
+# larger off-screen render (BMP):
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+  ./build/linux-release/bin/render_vulkan_test --size=800x500 --frames=64 --out=image.bmp
+```
+
+---
+
+## Troubleshooting
+
+**Something looks wrong on screen** — press `F12` and attach the BMP to an issue, together with
+the title-bar text and the console output (they give the back-end, GPU, mode and timings). Try
+`--backend=vulkan` on an NVIDIA card: if the Vulkan image is correct, the problem is in the
+NVIDIA path (OptiX / DLSS).
+
+**Blurry or shimmering image while moving (DLSS)** — build with `-DCRTX_DLSS_DEV_RUNTIME=ON` to
+show the DLSS debug overlay (motion vectors, jitter), and try `CRTX_DLSS_JITTER_SIGN=-1
+./CalculatoRTX` to flip the jitter convention. The still image is rendered natively and does not
+depend on DLSS.
+
+**"No Vulkan GPU with ray tracing" (AMD / Intel)** — install the Mesa driver (`vulkan-radeon`
+or `vulkan-intel` on Arch) and check that `vulkaninfo | grep -E "ray_query|acceleration_structure"`
+lists both extensions. Radeon cards older than the RX 6000 series have no ray accelerators.
+
+**`glslangValidator` not found** — install `glslang` (Arch) or `glslang-tools` (Ubuntu); on
+Windows it comes with the Vulkan SDK (`VULKAN_SDK` must be set).
+
+**`nvcc` rejects the compiler ("unsupported GNU version")** — Arch/CachyOS often ship a newer GCC
+than `nvcc` supports. The `cuda` package provides the right version:
+
+```bash
+export CUDAHOSTCXX=/usr/bin/g++-14     # adjust to the GCC installed by the cuda package
 ./scripts/build_linux.sh
 ```
 
-En dernier recours : `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler`.
+As a last resort: `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler`, or build without CUDA
+(`-DCRTX_ENABLE_CUDA=OFF`) and use the Vulkan back-end.
 
-**`OPTIX_ERROR_UNSUPPORTED_ABI_VERSION` au lancement** — le pilote est plus ancien que les en-têtes
-OptiX 9.1 : mettez le pilote à jour, ou reconfigurez avec `-DCRTX_OPTIX_GIT_TAG=v9.0.0`.
+**`OPTIX_ERROR_UNSUPPORTED_ABI_VERSION` at start-up** — the driver is older than the OptiX 9.1
+headers: update the driver, or reconfigure with `-DCRTX_OPTIX_GIT_TAG=v9.0.0`. The program falls
+back to the Vulkan back-end in the meantime.
 
-**Erreur PTX « Unsupported .version »** — le pilote est plus ancien que le CUDA Toolkit : la ligne
-« CUDA Version » de `nvidia-smi` doit être ≥ la version de `nvcc`. Mettez le pilote à jour.
+**PTX error "Unsupported .version"** — the driver is older than the CUDA toolkit: the "CUDA
+Version" line of `nvidia-smi` must be ≥ the `nvcc` version. Update the driver.
 
-**« DLSS non disponible »** (repli automatique en rendu natif) — vérifiez que
-`libnvidia-ngx-dlss.so.*` (Linux) ou `nvngx_dlss.dll` (Windows) est bien à côté de l'exécutable
-(copie automatique après compilation) et que `nvidia-smi` fonctionne. Journal NGX détaillé :
-`__NGX_LOG_LEVEL=1 ./CalculatoRTX` ; indicateur DLSS à l'écran : `__NGX_SHOW_INDICATOR=1`.
+**"DLSS not available"** (automatic fallback to native rendering) — check that
+`libnvidia-ngx-dlss.so.*` (Linux) or `nvngx_dlss.dll` (Windows) is next to the executable
+(copied automatically after the build) and that `nvidia-smi` works. Detailed NGX log:
+`__NGX_LOG_LEVEL=1 ./CalculatoRTX`; on-screen DLSS indicator: `__NGX_SHOW_INDICATOR=1`.
 
-**Image DLSS floue ou qui tremble** — compilez avec `-DCRTX_DLSS_DEV_RUNTIME=ON` pour afficher la
-surimpression de débogage DLSS (vecteurs de mouvement, jitter), et essayez
-`CRTX_DLSS_JITTER_SIGN=-1 ./CalculatoRTX` pour inverser la convention du jitter.
+**Vulkan errors** — run with `--validation` (requires `vulkan-validation-layers`) to get
+detailed messages.
 
-**Erreurs Vulkan** — relancez avec `--validation` (nécessite `vulkan-validation-layers`) pour
-obtenir des messages détaillés.
-
-**Performances** — `F3` (mode DLSS Performance), `F7` (moins de rebonds) ; `F5` permet de mesurer
-le gain du Shader Execution Reordering.
+**Performance** — `F3` (Performance mode), `F7` (fewer bounces), `F8` (1 sample per pixel while
+moving); `F5` measures the gain of Shader Execution Reordering on NVIDIA. Once the image has
+converged the GPU is idle.
 
 ---
 
 ## Licences
 
-- Code de CalculatoRTX : licence MIT (voir `LICENSE`).
-- En-têtes OptiX et SDK DLSS : propriété de NVIDIA, distribués sous leurs licences respectives ;
-  ils ne sont **pas** inclus dans ce dépôt mais téléchargés au moment de la configuration. La
-  bibliothèque d'exécution DLSS copiée à côté de l'exécutable doit être redistribuée selon les
-  conditions du SDK DLSS de NVIDIA (voir le dossier du SDK, section « Distributable Libraries » du
-  guide de programmation).
-- GLFW : licence zlib.
+- CalculatoRTX code: MIT licence (see `LICENSE`).
+- AMD FidelityFX FSR 1 (`third_party/fsr1`): MIT licence, © Advanced Micro Devices, Inc.
+  (see `third_party/fsr1/LICENSE.txt`).
+- OptiX headers and DLSS SDK: property of NVIDIA, distributed under their own licences; they are
+  **not** included in this repository but downloaded at configuration time. The DLSS runtime
+  library copied next to the executable must be redistributed under the terms of the NVIDIA DLSS
+  SDK (see the SDK folder, "Distributable Libraries" section of the programming guide).
+- GLFW: zlib licence.
 
-NVIDIA, RTX, DLSS, OptiX et CUDA sont des marques de NVIDIA Corporation. Ce projet n'est pas
-affilié à NVIDIA.
+NVIDIA, RTX, DLSS, OptiX and CUDA are trademarks of NVIDIA Corporation. AMD, Radeon and
+FidelityFX are trademarks of Advanced Micro Devices, Inc. This project is not affiliated with
+NVIDIA or AMD.

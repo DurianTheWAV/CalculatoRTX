@@ -1,7 +1,9 @@
 // CalculatoRTX - macros de vérification d'erreurs (CUDA / OptiX / Vulkan / NGX)
 #pragma once
 
+#if defined(CRTX_WITH_CUDA) || defined(__CUDACC__)
 #include <cuda_runtime.h>
+#endif
 
 #include <cstdio>
 #include <sstream>
@@ -19,6 +21,7 @@ namespace crtx {
 
 }  // namespace crtx
 
+#if defined(CRTX_WITH_CUDA) || defined(__CUDACC__)
 #define CUDA_CHECK(call)                                                                           \
     do {                                                                                           \
         cudaError_t crtxErr_ = (call);                                                             \
@@ -30,6 +33,7 @@ namespace crtx {
 
 // Vérifie l'erreur de lancement d'un kernel (asynchrone).
 #define CUDA_CHECK_LAST() CUDA_CHECK(cudaGetLastError())
+#endif
 
 #define CRTX_LOG(...)                                                                              \
     do {                                                                                           \

@@ -5,6 +5,7 @@
 #include "../common/Glyphs.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace crtx {
 
@@ -14,7 +15,7 @@ namespace {
 std::string G(unsigned char c) { return std::string(1, static_cast<char>(c)); }
 }  // namespace
 
-CalculatorController::CalculatorController(CalcEngine& engine) : engine_(engine) {}
+CalculatorController::CalculatorController(ICalcEngine& engine) : engine_(engine) {}
 
 std::string CalculatorController::statusMessage(int status)
 {
@@ -316,7 +317,9 @@ DisplayContent CalculatorController::display() const
     d.statusLeft = std::string(shift_ ? "2nd   " : "") + (angle_ == kDegrees ? "DEG" : "RAD");
     if (memHi_ != 0.0 || memLo_ != 0.0) d.statusLeft += "   M";
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "GPU %.0fus  DD", static_cast<double>(lastGpuMicros_));
+    // API qui a fait le calcul : "CUDA" (NVIDIA), "VK" (Vulkan compute), "CPU" (GPU sans FP64)
+    if (std::strcmp(engine_.apiName(), "CPU") == 0) std::snprintf(buf, sizeof(buf), "CPU  DD");
+    else std::snprintf(buf, sizeof(buf), "%s %.0fus  DD", engine_.apiName(), static_cast<double>(lastGpuMicros_));
     d.statusRight = buf;
     if (consistent_) d.statusRight += " " + G(glyph::kCheck);
     return d;

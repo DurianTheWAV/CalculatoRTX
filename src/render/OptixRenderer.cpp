@@ -70,8 +70,7 @@ OptixRenderer::OptixRenderer() = default;
 OptixRenderer::~OptixRenderer()
 {
     cudaDeviceSynchronize();
-    destroyDenoiser();
-    freeFrameBuffers();
+    for (Target& t : targets_) destroyTarget(t);
     for (Gas& g : gas_) freeGas(g);
     freePtr(iasBuffer_);
     freePtr(iasTemp_);
@@ -496,7 +495,7 @@ void OptixRenderer::syncScene(CalculatorScene& scene, cudaStream_t stream)
         ensureCapacity(dGeometries_, geometryCap_, geo.size());
         CUDA_CHECK(cudaMemcpyAsync(dGeometries_, geo.data(), sizeof(GeometryData) * geo.size(),
                                    cudaMemcpyHostToDevice, stream));
-        accumCount_ = 0;
+        for (Target& t : targets_) t.accumCount = 0;
     }
     const auto& mats = scene.materials();
     ensureCapacity(dMaterials_, materialCap_, mats.size());
@@ -513,80 +512,74 @@ void OptixRenderer::syncScene(CalculatorScene& scene, cudaStream_t stream)
 }
 
 // ---------------------------------------------------------------- images & débruiteur
-void OptixRenderer::freeFrameBuffers()
+void OptixRenderer::destroyTarget(Target& t)
 {
-    cudaFree(frameBlock_);
-    cudaFree(depth_);
-    cudaFree(motion_);
-    frameBlock_ = nullptr;
-    depth_ = nullptr;
-    motion_ = nullptr;
-    color_ = albedo_ = normal_ = accum_ = denoised_ = nullptr;
+    if (t.denoiser) optixDenoiserDestroy(t.denoiser);
+    freePtr(t.state);
+    freePtr(t.scratch);
+    freePtr(t.intensity);
+    cudaFree(t.block);
+    cudaFree(t.depth);
+    cudaFree(t.motion);
+    t = Target{};
 }
 
-void OptixRenderer::resize(unsigned width, unsigned height)
+void OptixRenderer::resize(int target, unsigned width, unsigned height)
 {
-    if (width == width_ && height == height_ && frameBlock_) return;
+    Target& t = targets_[target];
+    if (width == t.width && height == t.height && (t.block || width == 0)) return;
     CUDA_CHECK(cudaDeviceSynchronize());
-    destroyDenoiser();
-    freeFrameBuffers();
-    width_ = std::max(1u, width);
-    height_ = std::max(1u, height);
-    const size_t n = static_cast<size_t>(width_) * height_;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&frameBlock_), sizeof(float4) * n * 5));
-    CUDA_CHECK(cudaMemset(frameBlock_, 0, sizeof(float4) * n * 5));
-    color_ = frameBlock_;
-    albedo_ = frameBlock_ + n;
-    normal_ = frameBlock_ + 2 * n;
-    denoised_ = frameBlock_ + 3 * n;
-    accum_ = frameBlock_ + 4 * n;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&depth_), sizeof(float) * n));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&motion_), sizeof(float2) * n));
-    accumCount_ = 0;
-    l2Configured_ = false;
-    setupDenoiser();
+    destroyTarget(t);
+    if (l2Target_ == target) l2Target_ = -1;
+    if (width == 0 || height == 0) return;
+    t.width = width;
+    t.height = height;
+    const size_t n = static_cast<size_t>(width) * height;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&t.block), sizeof(float4) * n * 5));
+    CUDA_CHECK(cudaMemset(t.block, 0, sizeof(float4) * n * 5));
+    t.color = t.block;
+    t.albedo = t.block + n;
+    t.normal = t.block + 2 * n;
+    t.denoised = t.block + 3 * n;
+    t.accum = t.block + 4 * n;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&t.depth), sizeof(float) * n));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&t.motion), sizeof(float2) * n));
+    setupDenoiser(t);
 }
 
-void OptixRenderer::setupDenoiser()
+void OptixRenderer::setupDenoiser(Target& t)
 {
     OptixDenoiserOptions opt{};
     opt.guideAlbedo = 1;
     opt.guideNormal = 1;
     opt.denoiseAlpha = OPTIX_DENOISER_ALPHA_MODE_COPY;
-    OPTIX_CHECK(optixDenoiserCreate(context_, OPTIX_DENOISER_MODEL_KIND_AOV, &opt, &denoiser_));
+    OPTIX_CHECK(optixDenoiserCreate(context_, OPTIX_DENOISER_MODEL_KIND_AOV, &opt, &t.denoiser));
     OptixDenoiserSizes ds{};
-    OPTIX_CHECK(optixDenoiserComputeMemoryResources(denoiser_, width_, height_, &ds));
-    denoiserStateSize_ = ds.stateSizeInBytes;
-    denoiserScratchSize_ = std::max(ds.withoutOverlapScratchSizeInBytes, ds.computeIntensitySizeInBytes);
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&denoiserState_), denoiserStateSize_));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&denoiserScratch_), denoiserScratchSize_));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&denoiserIntensity_), sizeof(float)));
-    OPTIX_CHECK(optixDenoiserSetup(denoiser_, nullptr, width_, height_, denoiserState_, denoiserStateSize_,
-                                   denoiserScratch_, denoiserScratchSize_));
+    OPTIX_CHECK(optixDenoiserComputeMemoryResources(t.denoiser, t.width, t.height, &ds));
+    t.stateSize = ds.stateSizeInBytes;
+    t.scratchSize = std::max(ds.withoutOverlapScratchSizeInBytes, ds.computeIntensitySizeInBytes);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&t.state), t.stateSize));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&t.scratch), t.scratchSize));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&t.intensity), sizeof(float)));
+    OPTIX_CHECK(optixDenoiserSetup(t.denoiser, nullptr, t.width, t.height, t.state, t.stateSize, t.scratch,
+                                   t.scratchSize));
 }
 
-void OptixRenderer::destroyDenoiser()
+// Cache L2 d'Ada (32 Mo sur la RTX 4060 Ti / AD106, 48 Mo sur AD104) : fenêtre "persistante"
+// sur les images produites par le path tracer puis relues par le débruiteur. Sa taille est
+// bornée par ce que le pilote autorise, donc adaptée automatiquement à chaque GPU.
+void OptixRenderer::applyL2Persistence(int target, cudaStream_t stream)
 {
-    if (denoiser_) optixDenoiserDestroy(denoiser_);
-    denoiser_ = nullptr;
-    freePtr(denoiserState_);
-    freePtr(denoiserScratch_);
-    freePtr(denoiserIntensity_);
-}
-
-// Grand cache L2 d'Ada (48 Mo sur AD104) : fenêtre "persistante" sur les images
-// produites par le path tracer puis relues par le débruiteur.
-void OptixRenderer::applyL2Persistence(cudaStream_t stream)
-{
-    if (l2Configured_) return;
-    l2Configured_ = true;
+    if (l2Target_ == target) return;
+    l2Target_ = target;
+    const Target& t = targets_[target];
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     int maxPersist = 0, maxWindow = 0;
     cudaDeviceGetAttribute(&maxPersist, cudaDevAttrMaxPersistingL2CacheSize, dev);
     cudaDeviceGetAttribute(&maxWindow, cudaDevAttrMaxAccessPolicyWindowSize, dev);
     if (maxPersist <= 0 || maxWindow <= 0) return;
-    const size_t bytes = sizeof(float4) * static_cast<size_t>(width_) * height_ * 3;  // color+albedo+normal
+    const size_t bytes = sizeof(float4) * static_cast<size_t>(t.width) * t.height * 3;  // color+albedo+normal
     const size_t window = std::min(bytes, static_cast<size_t>(maxWindow));
     const size_t persist = std::min(static_cast<size_t>(maxPersist), window);
     if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist) != cudaSuccess) {
@@ -594,39 +587,38 @@ void OptixRenderer::applyL2Persistence(cudaStream_t stream)
         return;
     }
     cudaStreamAttrValue attr{};
-    attr.accessPolicyWindow.base_ptr = frameBlock_;
+    attr.accessPolicyWindow.base_ptr = t.block;
     attr.accessPolicyWindow.num_bytes = window;
     attr.accessPolicyWindow.hitRatio = std::min(1.0f, static_cast<float>(persist) / static_cast<float>(window));
     attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
     attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
     if (cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr) != cudaSuccess) cudaGetLastError();
-    else CRTX_LOG("Cache L2 : fenêtre persistante de %.1f Mo (hitRatio %.2f)", window / 1048576.0,
-                  attr.accessPolicyWindow.hitRatio);
 }
 
 // ---------------------------------------------------------------- lancement
-const float4* OptixRenderer::render(const FrameInput& in, const RenderSettings& rs, cudaStream_t stream)
+const float4* OptixRenderer::render(int target, const FrameInput& in, const RenderSettings& rs, cudaStream_t stream)
 {
-    applyL2Persistence(stream);
+    Target& t = targets_[target];
+    applyL2Persistence(target, stream);
     if (timingPending_) {  // chronos de l'image précédente (déjà terminée)
         cudaEventElapsedTime(&traceMs_, evTrace0_, evTrace1_);
-        if (rs.denoise) cudaEventElapsedTime(&denoiseMs_, evTrace1_, evDenoise1_);
+        if (timingDenoised_) cudaEventElapsedTime(&denoiseMs_, evTrace1_, evDenoise1_);
         else denoiseMs_ = 0.0f;
     }
 
     const bool accumulate = !in.dlss;
-    if (in.resetAccumulation || !accumulate) accumCount_ = 0;
+    if (in.resetAccumulation || !accumulate) t.accumCount = 0;
 
     LaunchParams& p = hParams_[0];
-    p.color = color_;
-    p.albedo = albedo_;
-    p.normal = normal_;
-    p.depth = depth_;
-    p.motion = motion_;
-    p.accum = accum_;
-    p.size = make_uint2(width_, height_);
+    p.color = t.color;
+    p.albedo = t.albedo;
+    p.normal = t.normal;
+    p.depth = t.depth;
+    p.motion = t.motion;
+    p.accum = t.accum;
+    p.size = make_uint2(t.width, t.height);
     p.frameIndex = in.frameIndex;
-    p.accumCount = accumCount_;
+    p.accumCount = t.accumCount;
     p.spp = rs.spp;
     p.maxBounces = rs.maxBounces;
     p.flags = (rs.ser ? kFlagSER : 0u) | (accumulate ? kFlagAccumulate : 0u) | (in.dlss ? kFlagDLSS : 0u) |
@@ -649,35 +641,39 @@ const float4* OptixRenderer::render(const FrameInput& in, const RenderSettings& 
     CUDA_CHECK(cudaMemcpyAsync(dParams_, &p, sizeof(LaunchParams), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaEventRecord(evTrace0_, stream));
     OPTIX_CHECK(optixLaunch(pipeline_, stream, reinterpret_cast<CUdeviceptr>(dParams_), sizeof(LaunchParams), &sbt_,
-                            width_, height_, 1));
+                            t.width, t.height, 1));
     CUDA_CHECK(cudaEventRecord(evTrace1_, stream));
-    if (accumulate) ++accumCount_;
+    if (accumulate) ++t.accumCount;
 
-    const float4* result = color_;
-    if (rs.denoise && denoiser_) {
-        const OptixImage2D colorImg = image2D(color_, width_, height_);
-        OPTIX_CHECK(optixDenoiserComputeIntensity(denoiser_, stream, &colorImg, denoiserIntensity_, denoiserScratch_,
-                                                  denoiserScratchSize_));
+    // Au-delà de quelques centaines d'échantillons l'image accumulée est déjà propre : le
+    // débruiteur la lisserait inutilement (et coûterait du temps GPU).
+    const bool denoise = rs.denoise && t.denoiser && (!accumulate || t.accumCount * rs.spp < 256);
+    const float4* result = t.color;
+    if (denoise) {
+        const OptixImage2D colorImg = image2D(t.color, t.width, t.height);
+        OPTIX_CHECK(optixDenoiserComputeIntensity(t.denoiser, stream, &colorImg, t.intensity, t.scratch, t.scratchSize));
         OptixDenoiserParams dp{};
-        dp.hdrIntensity = denoiserIntensity_;
+        dp.hdrIntensity = t.intensity;
         dp.blendFactor = 0.0f;
         OptixDenoiserGuideLayer guide{};
-        guide.albedo = image2D(albedo_, width_, height_);
-        guide.normal = image2D(normal_, width_, height_);
+        guide.albedo = image2D(t.albedo, t.width, t.height);
+        guide.normal = image2D(t.normal, t.width, t.height);
         OptixDenoiserLayer layer{};
         layer.input = colorImg;
-        layer.output = image2D(denoised_, width_, height_);
-        OPTIX_CHECK(optixDenoiserInvoke(denoiser_, stream, &dp, denoiserState_, denoiserStateSize_, &guide, &layer, 1,
-                                        0, 0, denoiserScratch_, denoiserScratchSize_));
-        result = denoised_;
+        layer.output = image2D(t.denoised, t.width, t.height);
+        OPTIX_CHECK(optixDenoiserInvoke(t.denoiser, stream, &dp, t.state, t.stateSize, &guide, &layer, 1, 0, 0,
+                                        t.scratch, t.scratchSize));
+        result = t.denoised;
     }
     CUDA_CHECK(cudaEventRecord(evDenoise1_, stream));
     timingPending_ = true;
+    timingDenoised_ = denoise;
     return result;
 }
 
-void OptixRenderer::pick(const CameraData& cam, float2 pixel, cudaStream_t stream)
+void OptixRenderer::pick(int target, const CameraData& cam, float2 pixel, cudaStream_t stream)
 {
+    const Target& t = targets_[target];
     LaunchParams& p = hParams_[1];
     p = hParams_[0];
     p.cam = cam;
@@ -685,7 +681,7 @@ void OptixRenderer::pick(const CameraData& cam, float2 pixel, cudaStream_t strea
     p.pickResult = dPick_;
     p.handle = ias_;
     p.instances = dInstances_;
-    p.size = make_uint2(width_, height_);
+    p.size = make_uint2(t.width, t.height);
     CUDA_CHECK(cudaMemcpyAsync(dParams_ + 1, &p, sizeof(LaunchParams), cudaMemcpyHostToDevice, stream));
     OPTIX_CHECK(optixLaunch(pipeline_, stream, reinterpret_cast<CUdeviceptr>(dParams_ + 1), sizeof(LaunchParams),
                             &sbtPick_, 1, 1, 1));

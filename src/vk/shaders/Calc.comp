@@ -1,0 +1,1036 @@
+// CalculatoRTX - moteur de calcul GPU, backend Vulkan (compute shader, FP64).
+//
+// Portage fidèle de src/calc/CalcCore.cuh / CalcEngine.cu. Un groupe de 4 invocations :
+//   * invocation 0  : analyse de l'expression (shunting-yard -> RPN en mémoire partagée),
+//                     littéraux convertis en double-double sur le GPU ;
+//   * invocations 0..3 : évaluation concurrente en double-double, FP64, FP32 et
+//                     arithmétique d'intervalles FP64 (arrondis dirigés émulés) ;
+//   * invocation 0  : croisement des 4 résultats et formatage décimal (texte de l'afficheur).
+#version 460
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "CalcDD.glsl"
+
+layout(local_size_x = 4) in;
+
+// Disposition identique à calc::Request / calc::Result (CalcTypes.h), en std430.
+layout(std430, binding = 0) readonly buffer RequestBuf {
+    uint program[64];
+    int programLength;
+    int angleMode;
+    double ansHi, ansLo, memHi, memLo;
+} rq;
+
+layout(std430, binding = 1) writeonly buffer ResultBuf {
+    int status;
+    int rpnLength;
+    double ddHi, ddLo;
+    double f64;
+    float f32;
+    double ivLo, ivHi;
+    int consistent;
+    int laneStatus[4];
+    uint text[12];
+} res;
+
+// ---- opcodes (CalcTypes.h)
+const uint kOpAdd = 43u, kOpSub = 45u, kOpMul = 42u, kOpDiv = 47u, kOpPow = 94u, kOpRoot = 82u, kOpNeg = 126u;
+const uint kFnSin = 115u, kFnCos = 99u, kFnTan = 116u, kFnAsin = 83u, kFnAcos = 67u, kFnAtan = 84u;
+const uint kFnLn = 108u, kFnLog10 = 76u, kFnSqrt = 113u, kFnCbrt = 81u, kFnExp = 120u, kFnPow10 = 88u;
+const uint kPostFact = 33u, kPostSquare = 119u, kPostCube = 87u, kPostInv = 105u;
+const uint kConstPi = 112u, kConstE = 101u, kRegAns = 65u, kRegMem = 77u;
+const uint kParOpen = 40u, kParClose = 41u;
+const uint kChar0 = 48u, kChar9 = 57u, kCharDot = 46u, kCharE = 69u, kCharPlus = 43u, kCharMinus = 45u;
+// ---- glyphes (Glyphs.h)
+const uint kGlyphTimes = 0x80u, kGlyphMinus = 0x82u, kSupBegin = 123u, kSupEnd = 125u;
+
+const int kOk = 0, kSyntaxError = 1, kDomainError = 2, kDivByZero = 3, kOverflow = 4, kEmpty = 5, kStackError = 6;
+const int kRadians = 0, kDegrees = 1;
+const int kMaxProgram = 256, kMaxText = 48;
+const int kMaxRpn = 128, kMaxStack = 64;
+const uint kValue = 0u, kUnary = 1u, kBinary = 2u;
+const double kEps = 2.220446049250313e-16LF;
+const double kPiD = 3.141592653589793LF;
+
+shared uint sKind[kMaxRpn];
+shared uint sOp[kMaxRpn];
+shared dvec2 sVal[kMaxRpn];
+shared int sCount;
+shared int sParseStatus;
+// résultats des voies
+shared int sStatus[4];
+shared dvec2 sDD;
+shared double sF64;
+shared float sF32;
+shared dvec2 sIv;
+
+void setErr(inout int err, int e)
+{
+    if (err == kOk) err = e;
+}
+
+void classify(double approx, inout int err)
+{
+    if (isNaND(approx)) setErr(err, kDomainError);
+    else if (!isFinD(approx)) setErr(err, kOverflow);
+}
+
+int posMod360(int d)
+{
+    const int a = abs(d) % 360;
+    return d < 0 ? (360 - a) % 360 : a;
+}
+
+// ============================================================================ analyse
+uint progByte(int i) { return (rq.program[i >> 2] >> (8u * uint(i & 3))) & 0xFFu; }
+
+bool isDigitC(uint c) { return c >= kChar0 && c <= kChar9; }
+
+bool isPrefixFn(uint c)
+{
+    return c == kFnSin || c == kFnCos || c == kFnTan || c == kFnAsin || c == kFnAcos || c == kFnAtan || c == kFnLn ||
+           c == kFnLog10 || c == kFnSqrt || c == kFnCbrt || c == kFnExp || c == kFnPow10;
+}
+bool isPostfix(uint c) { return c == kPostFact || c == kPostSquare || c == kPostCube || c == kPostInv; }
+bool isBinary(uint c)
+{
+    return c == kOpAdd || c == kOpSub || c == kOpMul || c == kOpDiv || c == kOpPow || c == kOpRoot;
+}
+
+int precedence(uint op)
+{
+    if (op == kOpAdd || op == kOpSub) return 1;
+    if (op == kOpMul || op == kOpDiv) return 2;
+    if (op == kOpNeg) return 3;
+    if (op == kOpPow || op == kOpRoot) return 4;
+    return isPrefixFn(op) ? 6 : 0;
+}
+bool rightAssoc(uint op) { return op == kOpPow || op == kOpRoot || op == kOpNeg; }
+
+int gCount;
+int gStatus;
+
+void emitValue(dvec2 v)
+{
+    if (gCount >= kMaxRpn) { gStatus = kStackError; return; }
+    sKind[gCount] = kValue;
+    sOp[gCount] = 0u;
+    sVal[gCount] = v;
+    ++gCount;
+}
+
+void emitOp(uint op)
+{
+    if (gCount >= kMaxRpn) { gStatus = kStackError; return; }
+    sKind[gCount] = isBinary(op) ? kBinary : kUnary;
+    sOp[gCount] = op;
+    sVal[gCount] = ddMake(0.0LF);
+    ++gCount;
+}
+
+// Littéral décimal -> double-double ; retourne l'indice suivant
+int parseNumber(int len, int pos, out dvec2 outV)
+{
+    dvec2 mant = ddMake(0.0LF);
+    int decimals = 0;
+    bool seenPoint = false;
+    int digits = 0;
+    int i = pos;
+    for (; i < len; ++i) {
+        const uint c = progByte(i);
+        if (isDigitC(c)) {
+            mant = ddAdd(ddMulD(mant, 10.0LF), ddMake(double(c - kChar0)));
+            if (seenPoint) ++decimals;
+            ++digits;
+        } else if (c == kCharDot && !seenPoint) {
+            seenPoint = true;
+        } else {
+            break;
+        }
+    }
+    int expo = 0;
+    if (i < len && progByte(i) == kCharE) {
+        ++i;
+        bool negExp = false;
+        if (i < len && (progByte(i) == kCharMinus || progByte(i) == kCharPlus)) {
+            negExp = progByte(i) == kCharMinus;
+            ++i;
+        }
+        int e = 0;
+        int ed = 0;
+        while (i < len && isDigitC(progByte(i)) && ed < 5) {
+            e = e * 10 + int(progByte(i) - kChar0);
+            ++i;
+            ++ed;
+        }
+        expo = negExp ? -e : e;
+        if (digits == 0) mant = ddMake(1.0LF);  // "E5" seul = 1E5
+    }
+    const int p10 = expo - decimals;
+    if (p10 >= 0) outV = ddMul(mant, ddPowInt(ddMake(10.0LF), int64_t(p10)));
+    else outV = ddDiv(mant, ddPowInt(ddMake(10.0LF), int64_t(-p10)));
+    return i;
+}
+
+uint gOps[kMaxStack];
+int gTop;
+bool gPrevValue;
+
+void pushOp(uint op)
+{
+    if (gTop >= kMaxStack) { gStatus = kStackError; return; }
+    gOps[gTop++] = op;
+}
+
+// Multiplication implicite : "2π", "3(4+5)", "(1+2)(3+4)", "2sin(30)"
+void implicitMul()
+{
+    if (!gPrevValue) return;
+    while (gTop > 0 && gOps[gTop - 1] != kParOpen) {
+        const uint o2 = gOps[gTop - 1];
+        if (precedence(o2) >= precedence(kOpMul)) {
+            emitOp(o2);
+            --gTop;
+        } else break;
+    }
+    pushOp(kOpMul);
+    gPrevValue = false;
+}
+
+void parseProgram()
+{
+    gCount = 0;
+    gStatus = kOk;
+    gTop = 0;
+    gPrevValue = false;
+    const int len = min(rq.programLength, kMaxProgram);
+    int i = 0;
+    while (i < len && gStatus == kOk) {
+        const uint c = progByte(i);
+        if (isDigitC(c) || c == kCharDot || c == kCharE) {
+            implicitMul();
+            dvec2 v;
+            i = parseNumber(len, i, v);
+            emitValue(v);
+            gPrevValue = true;
+            continue;
+        }
+        if (c == kConstPi || c == kConstE || c == kRegAns || c == kRegMem) {
+            implicitMul();
+            const dvec2 v = c == kConstPi ? kDdPi
+                          : c == kConstE  ? kDdE
+                          : c == kRegAns  ? dvec2(rq.ansHi, rq.ansLo)
+                                          : dvec2(rq.memHi, rq.memLo);
+            emitValue(v);
+            gPrevValue = true;
+            ++i;
+            continue;
+        }
+        if (isPrefixFn(c)) {
+            implicitMul();
+            pushOp(c);
+            gPrevValue = false;
+            ++i;
+            continue;
+        }
+        if (c == kParOpen) {
+            implicitMul();
+            pushOp(kParOpen);
+            gPrevValue = false;
+            ++i;
+            continue;
+        }
+        if (c == kParClose) {
+            bool found = false;
+            while (gTop > 0) {
+                const uint o = gOps[--gTop];
+                if (o == kParOpen) { found = true; break; }
+                emitOp(o);
+            }
+            if (!found) { gStatus = kSyntaxError; break; }
+            if (gTop > 0 && isPrefixFn(gOps[gTop - 1])) emitOp(gOps[--gTop]);
+            if (!gPrevValue) { gStatus = kSyntaxError; break; }  // "()"
+            gPrevValue = true;
+            ++i;
+            continue;
+        }
+        if (isPostfix(c)) {
+            if (!gPrevValue) { gStatus = kSyntaxError; break; }
+            emitOp(c);
+            ++i;
+            continue;
+        }
+        if (c == kOpNeg || ((c == kOpSub || c == kOpAdd) && !gPrevValue)) {
+            if (c != kOpAdd) pushOp(kOpNeg);  // '+' unaire ignoré
+            gPrevValue = false;
+            ++i;
+            continue;
+        }
+        if (isBinary(c)) {
+            if (!gPrevValue) { gStatus = kSyntaxError; break; }
+            const int p1 = precedence(c);
+            while (gTop > 0 && gOps[gTop - 1] != kParOpen) {
+                const uint o2 = gOps[gTop - 1];
+                const int p2 = precedence(o2);
+                if (p2 > p1 || (p2 == p1 && !rightAssoc(c))) {
+                    emitOp(o2);
+                    --gTop;
+                } else break;
+            }
+            pushOp(c);
+            gPrevValue = false;
+            ++i;
+            continue;
+        }
+        gStatus = kSyntaxError;  // octet inconnu
+    }
+    if (gStatus == kOk) {
+        if (gCount == 0) {
+            gStatus = kEmpty;
+        } else if (!gPrevValue) {
+            gStatus = kSyntaxError;  // expression terminée par un opérateur
+        } else {
+            while (gTop > 0) {  // parenthèses non fermées : fermeture automatique
+                const uint o = gOps[--gTop];
+                if (o != kParOpen) emitOp(o);
+            }
+        }
+    }
+}
+
+// ============================================================================ voie 0 : double-double
+double ddApprox(dvec2 v) { return v.x + v.y; }
+
+dvec2 ddCheck(dvec2 r, double approx, inout int err)
+{
+    if (!ddIsFinite(r)) {
+        if (isNaND(approx)) setErr(err, kDomainError);
+        else if (!isFinD(approx) || abs(approx) > 1e300LF) setErr(err, kOverflow);
+        else setErr(err, kDomainError);
+    }
+    return r;
+}
+
+bool exactDegTrig(uint fn, dvec2 x, out dvec2 outV, inout int err)
+{
+    outV = ddMake(0.0LF);
+    const dvec2 r = ddSub(x, ddMulD(ddRound(ddDiv(x, ddMake(360.0LF))), 360.0LF));  // [-180,180]
+    if (!ddIsInteger(r)) return false;
+    const int a = posMod360(int(r.x));
+    double s = 2.0LF, c = 2.0LF;  // 2 = pas de valeur exacte
+    if (a == 0) { s = 0.0LF; c = 1.0LF; }
+    else if (a == 30) s = 0.5LF;
+    else if (a == 60) c = 0.5LF;
+    else if (a == 90) { s = 1.0LF; c = 0.0LF; }
+    else if (a == 120) c = -0.5LF;
+    else if (a == 150) s = 0.5LF;
+    else if (a == 180) { s = 0.0LF; c = -1.0LF; }
+    else if (a == 210) s = -0.5LF;
+    else if (a == 240) c = -0.5LF;
+    else if (a == 270) { s = -1.0LF; c = 0.0LF; }
+    else if (a == 300) c = 0.5LF;
+    else if (a == 330) s = -0.5LF;
+    if (fn == kFnSin && s != 2.0LF) { outV = ddMake(s); return true; }
+    if (fn == kFnCos && c != 2.0LF) { outV = ddMake(c); return true; }
+    if (fn == kFnTan) {
+        if (a == 90 || a == 270) { setErr(err, kDomainError); return true; }
+        if (a == 0 || a == 180) { outV = ddMake(0.0LF); return true; }
+        if (a == 45 || a == 225) { outV = ddMake(1.0LF); return true; }
+        if (a == 135 || a == 315) { outV = ddMake(-1.0LF); return true; }
+    }
+    return false;
+}
+
+dvec2 ddTrig(uint fn, dvec2 x, int angle, inout int err)
+{
+    if (abs(x.x) > 1e15LF) { setErr(err, kDomainError); return ddMake(0.0LF); }
+    dvec2 outV;
+    if (angle == kDegrees && exactDegTrig(fn, x, outV, err)) return outV;
+    dvec2 rad = x;
+    if (angle == kDegrees) {
+        const dvec2 r = ddSub(x, ddMulD(ddRound(ddDiv(x, ddMake(360.0LF))), 360.0LF));
+        rad = ddMul(r, kDdDeg2Rad);
+    }
+    dvec2 s, c;
+    ddSinCos(rad, s, c);
+    if (fn == kFnSin) outV = s;
+    else if (fn == kFnCos) outV = c;
+    else {
+        if (abs(c.x) < 1e-40LF) { setErr(err, kDomainError); return ddMake(0.0LF); }
+        outV = ddDiv(s, c);
+    }
+    // sin(pi) en radians : le résidu ~1e-33 provient de l'erreur de pi en DD
+    if (angle == kRadians && abs(x.x) > 0.5LF && abs(outV.x) < 1e-29LF * abs(x.x)) outV = ddMake(0.0LF);
+    return outV;
+}
+
+dvec2 ddInvTrig(uint fn, dvec2 x, int angle, inout int err)
+{
+    dvec2 r;
+    if (fn == kFnAtan) r = ddAtan(x);
+    else {
+        if (abs(x.x) > 1.0LF || (abs(x.x) == 1.0LF && x.x * x.y > 0.0LF)) {
+            setErr(err, kDomainError);
+            return ddMake(0.0LF);
+        }
+        r = fn == kFnAsin ? ddAsin(x) : ddAcos(x);
+    }
+    if (angle == kDegrees) r = ddMul(r, kDdRad2Deg);
+    return r;
+}
+
+dvec2 ddPower(dvec2 x, dvec2 y, inout int err)
+{
+    if (ddIsInteger(y) && abs(y.x) < 4.0e18LF) {
+        const int64_t n = int64_t(y.x) + int64_t(y.y);
+        if (ddIsZero(x) && n < 0l) { setErr(err, kDivByZero); return ddMake(0.0LF); }
+        return ddCheck(ddPowInt(x, n), f64Pow(ddApprox(x), ddApprox(y)), err);
+    }
+    if (x.x > 0.0LF) return ddCheck(ddExp(ddMul(y, ddLog(x))), f64Pow(ddApprox(x), ddApprox(y)), err);
+    if (ddIsZero(x)) {
+        if (y.x > 0.0LF) return ddMake(0.0LF);
+        setErr(err, kDivByZero);
+        return ddMake(0.0LF);
+    }
+    setErr(err, kDomainError);  // base négative, exposant non entier
+    return ddMake(0.0LF);
+}
+
+dvec2 ddRoot(dvec2 n, dvec2 x, inout int err)  // racine n-ième de x
+{
+    if (ddIsZero(n)) { setErr(err, kDivByZero); return ddMake(0.0LF); }
+    if (x.x < 0.0LF) {
+        if (ddIsInteger(n)) {
+            const int64_t k = int64_t(n.x);
+            if ((k & 1l) != 0l) return -ddPower(-x, ddDiv(ddMake(1.0LF), n), err);
+        }
+        setErr(err, kDomainError);
+        return ddMake(0.0LF);
+    }
+    return ddPower(x, ddDiv(ddMake(1.0LF), n), err);
+}
+
+dvec2 ddFactorial(dvec2 x, inout int err)
+{
+    if (ddIsInteger(x)) {
+        if (x.x < 0.0LF) { setErr(err, kDomainError); return ddMake(0.0LF); }
+        if (x.x > 170.0LF) { setErr(err, kOverflow); return ddMake(0.0LF); }
+        dvec2 r = ddMake(1.0LF);
+        for (int k = 2; k <= int(x.x); ++k) r = ddMulD(r, double(k));
+        return r;
+    }
+    const dvec2 g = ddGamma(ddAdd(x, ddMake(1.0LF)));  // non entier : Gamma(x+1) en double-double
+    if (!ddIsFinite(g)) setErr(err, kOverflow);
+    return g;
+}
+
+dvec2 ddUnary(uint op, dvec2 x, int angle, inout int err)
+{
+    if (op == kOpNeg) return -x;
+    if (op == kFnSin || op == kFnCos || op == kFnTan) return ddTrig(op, x, angle, err);
+    if (op == kFnAsin || op == kFnAcos || op == kFnAtan) return ddInvTrig(op, x, angle, err);
+    if (op == kFnLn) {
+        if (x.x <= 0.0LF) { setErr(err, kDomainError); return ddMake(0.0LF); }
+        return ddLog(x);
+    }
+    if (op == kFnLog10) {
+        if (x.x <= 0.0LF) { setErr(err, kDomainError); return ddMake(0.0LF); }
+        return ddDiv(ddLog(x), kDdLn10);
+    }
+    if (op == kFnSqrt) {
+        if (x.x < 0.0LF) { setErr(err, kDomainError); return ddMake(0.0LF); }
+        return ddSqrt(x);
+    }
+    if (op == kFnCbrt) return ddCbrt(x);
+    if (op == kFnExp) return ddCheck(ddExp(x), f64Exp(ddApprox(x)), err);
+    if (op == kFnPow10) return ddPower(ddMake(10.0LF), x, err);
+    if (op == kPostFact) return ddFactorial(x, err);
+    if (op == kPostSquare) return ddCheck(ddMul(x, x), ddApprox(x) * ddApprox(x), err);
+    if (op == kPostCube) return ddCheck(ddMul(ddMul(x, x), x), ddApprox(x) * ddApprox(x) * ddApprox(x), err);
+    if (op == kPostInv) {
+        if (ddIsZero(x)) { setErr(err, kDivByZero); return ddMake(0.0LF); }
+        return ddDiv(ddMake(1.0LF), x);
+    }
+    setErr(err, kSyntaxError);
+    return x;
+}
+
+dvec2 ddBinary(uint op, dvec2 a, dvec2 b, inout int err)
+{
+    if (op == kOpAdd) return ddCheck(ddAdd(a, b), ddApprox(a) + ddApprox(b), err);
+    if (op == kOpSub) return ddCheck(ddSub(a, b), ddApprox(a) - ddApprox(b), err);
+    if (op == kOpMul) return ddCheck(ddMul(a, b), ddApprox(a) * ddApprox(b), err);
+    if (op == kOpDiv) {
+        if (ddIsZero(b)) { setErr(err, kDivByZero); return ddMake(0.0LF); }
+        return ddCheck(ddDiv(a, b), ddApprox(a) / ddApprox(b), err);
+    }
+    if (op == kOpPow) return ddPower(a, b, err);
+    if (op == kOpRoot) return ddRoot(a, b, err);
+    setErr(err, kSyntaxError);
+    return a;
+}
+
+int evaluateDD(int n, int angle, out dvec2 result)
+{
+    dvec2 stack[kMaxStack];
+    int sp = 0;
+    int err = kOk;
+    result = ddMake(0.0LF);
+    for (int i = 0; i < n && err == kOk; ++i) {
+        const uint kind = sKind[i];
+        if (kind == kValue) {
+            if (sp >= kMaxStack) { err = kStackError; break; }
+            stack[sp++] = sVal[i];
+        } else if (kind == kUnary) {
+            if (sp < 1) { err = kSyntaxError; break; }
+            stack[sp - 1] = ddUnary(sOp[i], stack[sp - 1], angle, err);
+        } else {
+            if (sp < 2) { err = kSyntaxError; break; }
+            const dvec2 b = stack[--sp];
+            stack[sp - 1] = ddBinary(sOp[i], stack[sp - 1], b, err);
+        }
+    }
+    if (err == kOk && sp != 1) err = kSyntaxError;
+    if (err == kOk) {
+        result = stack[0];
+        if (!ddIsFinite(result)) classify(ddApprox(result), err);
+        if (err == kOk && !ddIsFinite(result)) err = kOverflow;
+    }
+    return err;
+}
+
+// ============================================================================ voie 1 : FP64 IEEE
+double f64Unary(uint op, double x, int angle, inout int err)
+{
+    const double r2d = 180.0LF / kPiD;
+    if (op == kOpNeg) return -x;
+    if (op == kFnSin || op == kFnCos || op == kFnTan) {
+        const double r = angle == kDegrees ? x * (kPiD / 180.0LF) : x;
+        if (op == kFnSin) return f64Sin(r);
+        if (op == kFnCos) return f64Cos(r);
+        const double c = f64Cos(r);
+        if (c == 0.0LF) setErr(err, kDomainError);
+        return f64Sin(r) / c;
+    }
+    if (op == kFnAsin) {
+        if (abs(x) > 1.0LF) setErr(err, kDomainError);
+        return angle == kDegrees ? f64Asin(x) * r2d : f64Asin(x);
+    }
+    if (op == kFnAcos) {
+        if (abs(x) > 1.0LF) setErr(err, kDomainError);
+        return angle == kDegrees ? f64Acos(x) * r2d : f64Acos(x);
+    }
+    if (op == kFnAtan) return angle == kDegrees ? f64Atan(x) * r2d : f64Atan(x);
+    if (op == kFnLn) { if (x <= 0.0LF) setErr(err, kDomainError); return f64Log(x); }
+    if (op == kFnLog10) { if (x <= 0.0LF) setErr(err, kDomainError); return f64Log10(x); }
+    if (op == kFnSqrt) { if (x < 0.0LF) setErr(err, kDomainError); return x < 0.0LF ? qnanD() : sqrt(x); }
+    if (op == kFnCbrt) return f64Cbrt(x);
+    if (op == kFnExp) return f64Exp(x);
+    if (op == kFnPow10) return f64Pow(10.0LF, x);
+    if (op == kPostFact) {
+        if (x < 0.0LF && floor(x) == x) setErr(err, kDomainError);
+        return f64Tgamma(x + 1.0LF);
+    }
+    if (op == kPostSquare) return x * x;
+    if (op == kPostCube) return x * x * x;
+    if (op == kPostInv) { if (x == 0.0LF) setErr(err, kDivByZero); return 1.0LF / x; }
+    setErr(err, kSyntaxError);
+    return x;
+}
+
+double f64Binary(uint op, double a, double b, inout int err)
+{
+    if (op == kOpAdd) return a + b;
+    if (op == kOpSub) return a - b;
+    if (op == kOpMul) return a * b;
+    if (op == kOpDiv) { if (b == 0.0LF) setErr(err, kDivByZero); return a / b; }
+    if (op == kOpPow) return f64Pow(a, b);
+    if (op == kOpRoot) {
+        if (b < 0.0LF && f64IsOdd(a)) return -f64Pow(-b, 1.0LF / a);
+        return f64Pow(b, 1.0LF / a);
+    }
+    setErr(err, kSyntaxError);
+    return a;
+}
+
+int evaluateF64(int n, int angle, out double result)
+{
+    double stack[kMaxStack];
+    int sp = 0;
+    int err = kOk;
+    result = 0.0LF;
+    for (int i = 0; i < n && err == kOk; ++i) {
+        const uint kind = sKind[i];
+        if (kind == kValue) {
+            if (sp >= kMaxStack) { err = kStackError; break; }
+            stack[sp++] = sVal[i].x + sVal[i].y;
+        } else if (kind == kUnary) {
+            if (sp < 1) { err = kSyntaxError; break; }
+            stack[sp - 1] = f64Unary(sOp[i], stack[sp - 1], angle, err);
+        } else {
+            if (sp < 2) { err = kSyntaxError; break; }
+            const double b = stack[--sp];
+            stack[sp - 1] = f64Binary(sOp[i], stack[sp - 1], b, err);
+        }
+    }
+    if (err == kOk && sp != 1) err = kSyntaxError;
+    if (err == kOk) {
+        result = stack[0];
+        if (!isFinD(result)) classify(result, err);
+        if (err == kOk && !isFinD(result)) err = kOverflow;
+    }
+    return err;
+}
+
+// ============================================================================ voie 2 : FP32 IEEE
+bool isFinF(float x) { return (floatBitsToUint(x) & 0x7f800000u) != 0x7f800000u; }
+bool isNaNF(float x) { return (floatBitsToUint(x) & 0x7fffffffu) > 0x7f800000u; }
+
+float f32Pow(float x, float y)
+{
+    if (y == 0.0) return 1.0;
+    if (x < 0.0) {
+        if (floor(y) != y) return uintBitsToFloat(0x7fc00000u);
+        const float r = pow(-x, y);
+        return (abs(y) < 16777216.0 && (int(y) & 1) != 0) ? -r : r;
+    }
+    if (x == 0.0) return y > 0.0 ? 0.0 : uintBitsToFloat(0x7f800000u);
+    return pow(x, y);
+}
+
+float f32Unary(uint op, float x, int angle, inout int err)
+{
+    const float pi = 3.14159265358979;
+    const float r2d = 180.0 / pi;
+    if (op == kOpNeg) return -x;
+    if (op == kFnSin || op == kFnCos || op == kFnTan) {
+        const float r = angle == kDegrees ? x * (pi / 180.0) : x;
+        if (op == kFnSin) return sin(r);
+        if (op == kFnCos) return cos(r);
+        const float c = cos(r);
+        if (c == 0.0) setErr(err, kDomainError);
+        return sin(r) / c;
+    }
+    if (op == kFnAsin) { if (abs(x) > 1.0) setErr(err, kDomainError); return angle == kDegrees ? asin(x) * r2d : asin(x); }
+    if (op == kFnAcos) { if (abs(x) > 1.0) setErr(err, kDomainError); return angle == kDegrees ? acos(x) * r2d : acos(x); }
+    if (op == kFnAtan) return angle == kDegrees ? atan(x) * r2d : atan(x);
+    if (op == kFnLn) { if (x <= 0.0) setErr(err, kDomainError); return log(x); }
+    if (op == kFnLog10) { if (x <= 0.0) setErr(err, kDomainError); return log(x) * 0.4342944819; }
+    if (op == kFnSqrt) { if (x < 0.0) setErr(err, kDomainError); return sqrt(max(x, 0.0)); }
+    if (op == kFnCbrt) return sign(x) * pow(abs(x), 1.0 / 3.0);
+    if (op == kFnExp) return exp(x);
+    if (op == kFnPow10) return f32Pow(10.0, x);
+    if (op == kPostFact) {
+        if (x < 0.0 && floor(x) == x) setErr(err, kDomainError);
+        return float(f64Tgamma(double(x) + 1.0LF));
+    }
+    if (op == kPostSquare) return x * x;
+    if (op == kPostCube) return x * x * x;
+    if (op == kPostInv) { if (x == 0.0) setErr(err, kDivByZero); return 1.0 / x; }
+    setErr(err, kSyntaxError);
+    return x;
+}
+
+float f32Binary(uint op, float a, float b, inout int err)
+{
+    if (op == kOpAdd) return a + b;
+    if (op == kOpSub) return a - b;
+    if (op == kOpMul) return a * b;
+    if (op == kOpDiv) { if (b == 0.0) setErr(err, kDivByZero); return a / b; }
+    if (op == kOpPow) return f32Pow(a, b);
+    if (op == kOpRoot) {
+        if (b < 0.0 && floor(a) == a && mod(a, 2.0) != 0.0) return -f32Pow(-b, 1.0 / a);
+        return f32Pow(b, 1.0 / a);
+    }
+    setErr(err, kSyntaxError);
+    return a;
+}
+
+int evaluateF32(int n, int angle, out float result)
+{
+    float stack[kMaxStack];
+    int sp = 0;
+    int err = kOk;
+    result = 0.0;
+    for (int i = 0; i < n && err == kOk; ++i) {
+        const uint kind = sKind[i];
+        if (kind == kValue) {
+            if (sp >= kMaxStack) { err = kStackError; break; }
+            stack[sp++] = float(sVal[i].x + sVal[i].y);
+        } else if (kind == kUnary) {
+            if (sp < 1) { err = kSyntaxError; break; }
+            stack[sp - 1] = f32Unary(sOp[i], stack[sp - 1], angle, err);
+        } else {
+            if (sp < 2) { err = kSyntaxError; break; }
+            const float b = stack[--sp];
+            stack[sp - 1] = f32Binary(sOp[i], stack[sp - 1], b, err);
+        }
+    }
+    if (err == kOk && sp != 1) err = kSyntaxError;
+    if (err == kOk) {
+        result = stack[0];
+        if (!isFinF(result)) setErr(err, isNaNF(result) ? kDomainError : kOverflow);
+    }
+    return err;
+}
+
+// ============================================================================ voie 3 : intervalles
+// Arrondis dirigés émulés : arrondi au plus proche, puis le signe de l'erreur exacte
+// (TwoSum / TwoProd) indique s'il faut passer au double adjacent - un résultat exact reste
+// exact, comme avec les instructions __dadd_rd... de CUDA. Division et racine (dont Vulkan
+// tolère une petite erreur d'arrondi) : élargies de quelques ulps sauf si le résultat est exact.
+double ivDn(double v, int ulps) { return v - abs(v) * double(ulps + 1) * kEps - 2.2250738585072014e-308LF; }
+double ivUp(double v, int ulps) { return v + abs(v) * double(ulps + 1) * kEps + 2.2250738585072014e-308LF; }
+double addRd(double a, double b) { const dvec2 s = twoSum(a, b); return s.y < 0.0LF ? nextDownD(s.x) : s.x; }
+double addRu(double a, double b) { const dvec2 s = twoSum(a, b); return s.y > 0.0LF ? nextUpD(s.x) : s.x; }
+double subRd(double a, double b) { return addRd(a, -b); }
+double subRu(double a, double b) { return addRu(a, -b); }
+double mulRd(double a, double b) { const dvec2 p = twoProd(a, b); return p.y < 0.0LF ? nextDownD(p.x) : p.x; }
+double mulRu(double a, double b) { const dvec2 p = twoProd(a, b); return p.y > 0.0LF ? nextUpD(p.x) : p.x; }
+bool exactQuot(double a, double b, double q) { const dvec2 p = twoProd(q, b); return p.x == a && p.y == 0.0LF; }
+double divRd(double a, double b) { const double q = a / b; return exactQuot(a, b, q) ? q : ivDn(q, 2); }
+double divRu(double a, double b) { const double q = a / b; return exactQuot(a, b, q) ? q : ivUp(q, 2); }
+bool exactSqrt(double a, double s) { const dvec2 p = twoProd(s, s); return p.x == a && p.y == 0.0LF; }
+double sqrtRd(double a) { const double s = sqrt(a); return exactSqrt(a, s) ? s : ivDn(s, 2); }
+double sqrtRu(double a) { const double s = sqrt(a); return exactSqrt(a, s) ? s : ivUp(s, 2); }
+
+dvec2 ivPt(double v) { return dvec2(v, v); }
+dvec2 ivFromDD(dvec2 v) { return dvec2(addRd(v.x, v.y), addRu(v.x, v.y)); }
+double ivApprox(dvec2 v) { return 0.5LF * (v.x + v.y); }
+dvec2 ivAdd(dvec2 a, dvec2 b) { return dvec2(addRd(a.x, b.x), addRu(a.y, b.y)); }
+dvec2 ivSub(dvec2 a, dvec2 b) { return dvec2(subRd(a.x, b.y), subRu(a.y, b.x)); }
+dvec2 ivMul(dvec2 a, dvec2 b)
+{
+    const double l = min(min(mulRd(a.x, b.x), mulRd(a.x, b.y)), min(mulRd(a.y, b.x), mulRd(a.y, b.y)));
+    const double h = max(max(mulRu(a.x, b.x), mulRu(a.x, b.y)), max(mulRu(a.y, b.x), mulRu(a.y, b.y)));
+    return dvec2(l, h);
+}
+dvec2 ivDiv(dvec2 a, dvec2 b, inout int err)
+{
+    if (b.x <= 0.0LF && b.y >= 0.0LF) { setErr(err, kDivByZero); return ivPt(0.0LF); }
+    const double l = min(min(divRd(a.x, b.x), divRd(a.x, b.y)), min(divRd(a.y, b.x), divRd(a.y, b.y)));
+    const double h = max(max(divRu(a.x, b.x), divRu(a.x, b.y)), max(divRu(a.y, b.x), divRu(a.y, b.y)));
+    return dvec2(l, h);
+}
+dvec2 ivDeg2Rad() { return dvec2(0.017453292519943295LF, nextUpD(0.017453292519943295LF)); }
+dvec2 ivRad2Deg() { return dvec2(nextDownD(57.29577951308232LF), 57.29577951308232LF); }
+
+dvec2 ivSinCos(bool isSin, dvec2 r)
+{
+    // Lipschitz 1 : f([m-h, m+h]) inclus dans [f(m)-h, f(m)+h]
+    const double m = 0.5LF * (r.x + r.y);
+    const double h = addRu(mulRu(subRu(r.y, r.x), 0.5LF), abs(m) * 2.0LF * kEps);
+    const double v = isSin ? f64Sin(m) : f64Cos(m);
+    return dvec2(max(-1.0LF, ivDn(v, 2) - h), min(1.0LF, ivUp(v, 2) + h));
+}
+
+dvec2 ivPower(dvec2 a, dvec2 b, inout int err)
+{
+    if (b.x == b.y && floor(b.x) == b.x && abs(b.x) <= 1024.0LF) {
+        const int n = int(abs(b.x));
+        dvec2 r = ivPt(1.0LF);
+        for (int k = 0; k < n; ++k) r = ivMul(r, a);
+        if (n % 2 == 0 && a.x <= 0.0LF && a.y >= 0.0LF) r.x = max(r.x, 0.0LF);
+        return b.x < 0.0LF ? ivDiv(ivPt(1.0LF), r, err) : r;
+    }
+    if (a.x <= 0.0LF) {
+        if (a.x == 0.0LF && a.y == 0.0LF && b.x > 0.0LF) return ivPt(0.0LF);
+        setErr(err, kDomainError);
+        return ivPt(0.0LF);
+    }
+    const dvec2 lg = dvec2(ivDn(f64Log(a.x), 1), ivUp(f64Log(a.y), 1));
+    const dvec2 e = ivMul(b, lg);
+    return dvec2(ivDn(f64Exp(e.x), 1), ivUp(f64Exp(e.y), 1));
+}
+
+dvec2 ivUnary(uint op, dvec2 x, int angle, inout int err)
+{
+    const dvec2 r = angle == kDegrees ? ivMul(x, ivDeg2Rad()) : x;
+    if (op == kOpNeg) return dvec2(-x.y, -x.x);
+    if (op == kFnSin) return ivSinCos(true, r);
+    if (op == kFnCos) return ivSinCos(false, r);
+    if (op == kFnTan) {
+        const double k0 = floor(r.x / kPiD - 0.5LF), k1 = floor(r.y / kPiD - 0.5LF);
+        if (k0 != k1) { setErr(err, kDomainError); return ivPt(0.0LF); }
+        return dvec2(ivDn(f64Tan(r.x), 2), ivUp(f64Tan(r.y), 2));
+    }
+    if (op == kFnAsin || op == kFnAcos) {
+        if (x.x < -1.0LF || x.y > 1.0LF) { setErr(err, kDomainError); return ivPt(0.0LF); }
+        const dvec2 v = op == kFnAsin ? dvec2(ivDn(f64Asin(x.x), 2), ivUp(f64Asin(x.y), 2))
+                                      : dvec2(ivDn(f64Acos(x.y), 2), ivUp(f64Acos(x.x), 2));
+        return angle == kDegrees ? ivMul(v, ivRad2Deg()) : v;
+    }
+    if (op == kFnAtan) {
+        const dvec2 v = dvec2(ivDn(f64Atan(x.x), 2), ivUp(f64Atan(x.y), 2));
+        return angle == kDegrees ? ivMul(v, ivRad2Deg()) : v;
+    }
+    if (op == kFnLn) {
+        if (x.x <= 0.0LF) { setErr(err, kDomainError); return ivPt(0.0LF); }
+        return dvec2(ivDn(f64Log(x.x), 1), ivUp(f64Log(x.y), 1));
+    }
+    if (op == kFnLog10) {
+        if (x.x <= 0.0LF) { setErr(err, kDomainError); return ivPt(0.0LF); }
+        return dvec2(ivDn(f64Log10(x.x), 2), ivUp(f64Log10(x.y), 2));
+    }
+    if (op == kFnSqrt) {
+        if (x.y < 0.0LF) { setErr(err, kDomainError); return ivPt(0.0LF); }
+        return dvec2(sqrtRd(max(x.x, 0.0LF)), sqrtRu(x.y));
+    }
+    if (op == kFnCbrt) return dvec2(ivDn(f64Cbrt(x.x), 1), ivUp(f64Cbrt(x.y), 1));
+    if (op == kFnExp) return dvec2(ivDn(f64Exp(x.x), 1), ivUp(f64Exp(x.y), 1));
+    if (op == kFnPow10) return dvec2(ivDn(f64Pow(10.0LF, x.x), 2), ivUp(f64Pow(10.0LF, x.y), 2));
+    if (op == kPostFact) {
+        if (x.x == x.y && floor(x.x) == x.x && x.x >= 0.0LF && x.x <= 170.0LF) {
+            dvec2 p = ivPt(1.0LF);
+            for (int k = 2; k <= int(x.x); ++k) p = ivMul(p, ivPt(double(k)));
+            return p;
+        }
+        if (x.x < 0.0LF && floor(x.x) == x.x) { setErr(err, kDomainError); return ivPt(0.0LF); }
+        const double g = f64Tgamma(ivApprox(x) + 1.0LF);
+        const double w = abs(g) * 1e-12LF + abs(x.y - x.x) * abs(g) * 10.0LF;
+        return dvec2(g - w, g + w);
+    }
+    if (op == kPostSquare) {
+        dvec2 s = ivMul(x, x);
+        if (x.x <= 0.0LF && x.y >= 0.0LF) s.x = 0.0LF;
+        return s;
+    }
+    if (op == kPostCube) return ivMul(ivMul(x, x), x);
+    if (op == kPostInv) return ivDiv(ivPt(1.0LF), x, err);
+    setErr(err, kSyntaxError);
+    return x;
+}
+
+dvec2 ivBinary(uint op, dvec2 a, dvec2 b, inout int err)
+{
+    if (op == kOpAdd) return ivAdd(a, b);
+    if (op == kOpSub) return ivSub(a, b);
+    if (op == kOpMul) return ivMul(a, b);
+    if (op == kOpDiv) return ivDiv(a, b, err);
+    if (op == kOpPow) return ivPower(a, b, err);
+    if (op == kOpRoot) {
+        if (b.y < 0.0LF && a.x == a.y && f64IsOdd(a.x)) {
+            const dvec2 r = ivPower(dvec2(-b.y, -b.x), ivDiv(ivPt(1.0LF), a, err), err);
+            return dvec2(-r.y, -r.x);
+        }
+        return ivPower(b, ivDiv(ivPt(1.0LF), a, err), err);
+    }
+    setErr(err, kSyntaxError);
+    return a;
+}
+
+int evaluateIv(int n, int angle, out dvec2 result)
+{
+    dvec2 stack[kMaxStack];
+    int sp = 0;
+    int err = kOk;
+    result = ivPt(0.0LF);
+    for (int i = 0; i < n && err == kOk; ++i) {
+        const uint kind = sKind[i];
+        if (kind == kValue) {
+            if (sp >= kMaxStack) { err = kStackError; break; }
+            stack[sp++] = ivFromDD(sVal[i]);
+        } else if (kind == kUnary) {
+            if (sp < 1) { err = kSyntaxError; break; }
+            stack[sp - 1] = ivUnary(sOp[i], stack[sp - 1], angle, err);
+        } else {
+            if (sp < 2) { err = kSyntaxError; break; }
+            const dvec2 b = stack[--sp];
+            stack[sp - 1] = ivBinary(sOp[i], stack[sp - 1], b, err);
+        }
+    }
+    if (err == kOk && sp != 1) err = kSyntaxError;
+    if (err == kOk) {
+        result = stack[0];
+        const bool fin = isFinD(result.x) && isFinD(result.y);
+        if (!fin) classify(ivApprox(result), err);
+        if (err == kOk && !fin) err = kOverflow;
+    }
+    return err;
+}
+
+// ============================================================================ formatage décimal
+uint gText[12];
+int gTextLen;
+
+void appendChar(uint c)
+{
+    if (gTextLen < kMaxText - 1) {
+        const int w = gTextLen >> 2, sh = (gTextLen & 3) * 8;
+        gText[w] = (gText[w] & ~(0xFFu << sh)) | ((c & 0xFFu) << sh);
+        ++gTextLen;
+    }
+}
+
+void appendInt(int v)
+{
+    uint tmp[12];
+    int k = 0;
+    if (v == 0) tmp[k++] = kChar0;
+    while (v > 0 && k < 12) {
+        tmp[k++] = kChar0 + uint(v % 10);
+        v /= 10;
+    }
+    while (k > 0) appendChar(tmp[--k]);
+}
+
+uint gDigits[20];
+
+// Extrait 'sig' chiffres significatifs arrondis de |v| ; retourne l'exposant décimal.
+int extractDigits(dvec2 a, int sig)
+{
+    int e = int(floor(f64Log10(a.x)));
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const int shift = e - sig + 1;
+        dvec2 scaled;
+        if (shift >= 0) {
+            scaled = ddDiv(a, ddPowInt(ddMake(10.0LF), int64_t(shift)));
+        } else {  // en deux fois : 10^309 dépasserait la plage des doubles (résultats < 1e-299)
+            const int k1 = min(-shift, 300);
+            scaled = ddMul(ddMul(a, ddPowInt(ddMake(10.0LF), int64_t(k1))), ddPowInt(ddMake(10.0LF), int64_t(-shift - k1)));
+        }
+        const dvec2 nr = ddRound(scaled);
+        double lim = 1.0LF;
+        for (int k = 0; k < sig; ++k) lim *= 10.0LF;
+        if (nr.x >= lim) { ++e; continue; }          // l'arrondi a fait "déborder" (9.99 -> 10.0)
+        if (nr.x < lim / 10.0LF) { --e; continue; }  // estimation log10 trop grande
+        uint64_t u = uint64_t(nr.x);
+        const int64_t lo = int64_t(nr.y);
+        u = uint64_t(int64_t(u) + lo);
+        for (int k = sig - 1; k >= 0; --k) {
+            gDigits[k] = kChar0 + uint(u % 10ul);
+            u /= 10ul;
+        }
+        return e;
+    }
+    for (int k = 0; k < sig; ++k) gDigits[k] = kChar0;
+    gDigits[0] = kChar0 + 1u;
+    return e;
+}
+
+void formatResult(dvec2 v)
+{
+    for (int i = 0; i < 12; ++i) gText[i] = 0u;
+    gTextLen = 0;
+    if (v.x == 0.0LF) {
+        appendChar(kChar0);
+        return;
+    }
+    if (v.x < 0.0LF) {
+        appendChar(kGlyphMinus);
+        v = -v;
+    }
+    const int e0 = int(floor(f64Log10(v.x)));
+    const bool fixedNotation = e0 >= -6 && e0 < 15;
+    int sig = fixedNotation ? (e0 >= 0 ? 15 : 15 + e0) : 10;
+    if (sig < 1) sig = 1;
+    int e = extractDigits(v, sig);
+    if (fixedNotation && e >= 15) {  // l'arrondi a franchi 10^15 : notation scientifique
+        sig = 10;
+        e = extractDigits(v, sig);
+    }
+    const bool useFixed = e >= -6 && e < 15;
+    int last = sig - 1;  // supprime les zéros non significatifs en fin de mantisse
+    if (useFixed) {
+        const int minKeep = e >= 0 ? e : 0;  // ne pas couper la partie entière
+        while (last > minKeep && gDigits[last] == kChar0) --last;
+    } else {
+        while (last > 0 && gDigits[last] == kChar0) --last;
+    }
+    if (useFixed) {
+        if (e < 0) {
+            appendChar(kChar0);
+            appendChar(kCharDot);
+            for (int k = 0; k < -e - 1; ++k) appendChar(kChar0);
+            for (int k = 0; k <= last; ++k) appendChar(gDigits[k]);
+        } else {
+            for (int k = 0; k <= last || k <= e; ++k) {
+                appendChar(k <= last ? gDigits[k] : kChar0);
+                if (k == e && k < last) appendChar(kCharDot);
+            }
+        }
+    } else {
+        appendChar(gDigits[0]);
+        if (last > 0) {
+            appendChar(kCharDot);
+            for (int k = 1; k <= last; ++k) appendChar(gDigits[k]);
+        }
+        appendChar(kGlyphTimes);
+        appendChar(kChar0 + 1u);
+        appendChar(kChar0);
+        appendChar(kSupBegin);
+        if (e < 0) appendChar(kGlyphMinus);
+        appendInt(e < 0 ? -e : e);
+        appendChar(kSupEnd);
+    }
+}
+
+// ============================================================================ point d'entrée
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    if (lane == 0u) {
+        parseProgram();
+        sCount = gCount;
+        sParseStatus = gStatus;
+    }
+    barrier();
+
+    // Évaluation concurrente dans 4 arithmétiques différentes
+    const int n = sCount;
+    int status = sParseStatus;
+    const int angle = rq.angleMode;
+    if (status == kOk) {
+        if (lane == 0u) {
+            dvec2 v;
+            status = evaluateDD(n, angle, v);
+            sDD = v;
+        } else if (lane == 1u) {
+            double v;
+            status = evaluateF64(n, angle, v);
+            sF64 = v;
+        } else if (lane == 2u) {
+            float v;
+            status = evaluateF32(n, angle, v);
+            sF32 = v;
+        } else {
+            dvec2 v;
+            status = evaluateIv(n, angle, v);
+            sIv = v;
+        }
+    } else {
+        if (lane == 0u) sDD = ddMake(0.0LF);
+        else if (lane == 1u) sF64 = 0.0LF;
+        else if (lane == 2u) sF32 = 0.0;
+        else sIv = ivPt(0.0LF);
+    }
+    sStatus[lane] = status;
+    barrier();
+
+    if (lane == 0u) {
+        const dvec2 vDD = sDD;
+        const int st = sStatus[0], st64 = sStatus[1], st32 = sStatus[2], stIv = sStatus[3];
+        res.status = st;
+        res.rpnLength = n;
+        res.ddHi = vDD.x;
+        res.ddLo = vDD.y;
+        res.f64 = sF64;
+        res.f32 = sF32;
+        res.ivLo = sIv.x;
+        res.ivHi = sIv.y;
+        res.laneStatus[0] = st;
+        res.laneStatus[1] = st64;
+        res.laneStatus[2] = st32;
+        res.laneStatus[3] = stIv;
+        const double x = vDD.x + vDD.y;
+        const bool inInterval = stIv == kOk && x >= sIv.x && x <= sIv.y;
+        const bool agree64 = st64 == kOk && abs(sF64 - x) <= 1e-12LF * max(1.0LF, abs(x));
+        res.consistent = (st == kOk && inInterval && agree64) ? 1 : 0;
+        if (st == kOk) formatResult(vDD);
+        else {
+            for (int i = 0; i < 12; ++i) gText[i] = 0u;
+        }
+        for (int i = 0; i < 12; ++i) res.text[i] = gText[i];
+    }
+}

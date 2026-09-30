@@ -143,7 +143,7 @@ __global__ void composite(const void* in, bool half, const float4* bloom, int bw
     if (x >= w || y >= h) return;
     const float u = (x + 0.5f) / w, v = (y + 0.5f) / h;
     float3 c = loadColor(in, half, y * w + x) * prm->exposure;
-    c += sampleBloom(bloom, bw, bh, u, v) * prm->bloomStrength * 16.0f;
+    c += sampleBloom(bloom, bw, bh, u, v) * prm->bloomStrength;  // fraction de l'énergie au-dessus du seuil
     // vignettage optique léger
     const float dx = u - 0.5f, dy = v - 0.5f;
     c = c * (1.0f - prm->vignette * (dx * dx + dy * dy) * 2.0f);

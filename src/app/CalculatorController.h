@@ -1,11 +1,11 @@
 // CalculatoRTX - logique de saisie de la calculatrice.
 //
 // Cette classe ne fait que manipuler du texte (jetons saisis) : toutes les valeurs
-// numériques sont calculées par le GPU via calc::CalcEngine (y compris l'addition
+// numériques sont calculées par le GPU via calc::ICalcEngine - CUDA ou Vulkan (y compris l'addition
 // mémoire M+/M- et l'aperçu en direct du résultat).
 #pragma once
 
-#include "../calc/CalcEngine.h"
+#include "../calc/ICalcEngine.h"
 #include "../scene/CalculatorScene.h"
 #include "../scene/Keys.h"
 
@@ -16,7 +16,7 @@ namespace crtx {
 
 class CalculatorController {
 public:
-    explicit CalculatorController(calc::CalcEngine& engine);
+    explicit CalculatorController(calc::ICalcEngine& engine);
 
     void press(KeyId key);
 
@@ -48,7 +48,7 @@ private:
     bool lastEndsValue() const;
     static std::string statusMessage(int status);
 
-    calc::CalcEngine& engine_;
+    calc::ICalcEngine& engine_;
     std::vector<Token> tokens_;
     bool shift_ = false;
     calc::AngleMode angle_ = calc::kDegrees;

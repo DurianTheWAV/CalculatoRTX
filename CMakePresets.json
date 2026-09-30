@@ -4,14 +4,22 @@
     "configurePresets": [
         {
             "name": "linux-release",
-            "displayName": "Linux (CachyOS/Arch/Ubuntu) - Release",
+            "displayName": "Linux - Release (NVIDIA backend if CUDA is found + Vulkan backend)",
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/linux-release",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_CUDA_ARCHITECTURES": "89"
+                "CMAKE_CUDA_ARCHITECTURES": "89",
+                "CRTX_ENABLE_CUDA": "AUTO"
             },
             "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+        },
+        {
+            "name": "linux-vulkan",
+            "inherits": "linux-release",
+            "displayName": "Linux - Release, Vulkan backend only (AMD / Intel, no CUDA)",
+            "binaryDir": "${sourceDir}/build/linux-vulkan",
+            "cacheVariables": { "CRTX_ENABLE_CUDA": "OFF" }
         },
         {
             "name": "linux-debug",
@@ -22,21 +30,32 @@
         },
         {
             "name": "windows-release",
-            "displayName": "Windows (Visual Studio 2022) - Release",
+            "displayName": "Windows (Visual Studio 2022) - Release (NVIDIA + Vulkan backends)",
             "generator": "Visual Studio 17 2022",
             "architecture": "x64",
-            "binaryDir": "${sourceDir}/build/windows",
-            "cacheVariables": { "CMAKE_CUDA_ARCHITECTURES": "89" },
+            "binaryDir": "${sourceDir}/build/windows-release",
+            "cacheVariables": { "CMAKE_CUDA_ARCHITECTURES": "89", "CRTX_ENABLE_CUDA": "AUTO" },
             "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        },
+        {
+            "name": "windows-vulkan",
+            "inherits": "windows-release",
+            "displayName": "Windows - Release, Vulkan backend only (AMD / Intel, no CUDA)",
+            "binaryDir": "${sourceDir}/build/windows-vulkan",
+            "cacheVariables": { "CRTX_ENABLE_CUDA": "OFF" }
         }
     ],
     "buildPresets": [
         { "name": "linux-release", "configurePreset": "linux-release" },
+        { "name": "linux-vulkan", "configurePreset": "linux-vulkan" },
         { "name": "linux-debug", "configurePreset": "linux-debug" },
-        { "name": "windows-release", "configurePreset": "windows-release", "configuration": "Release" }
+        { "name": "windows-release", "configurePreset": "windows-release", "configuration": "Release" },
+        { "name": "windows-vulkan", "configurePreset": "windows-vulkan", "configuration": "Release" }
     ],
     "testPresets": [
         { "name": "linux-release", "configurePreset": "linux-release", "output": { "outputOnFailure": true } },
-        { "name": "windows-release", "configurePreset": "windows-release", "configuration": "Release", "output": { "outputOnFailure": true } }
+        { "name": "linux-vulkan", "configurePreset": "linux-vulkan", "output": { "outputOnFailure": true } },
+        { "name": "windows-release", "configurePreset": "windows-release", "configuration": "Release", "output": { "outputOnFailure": true } },
+        { "name": "windows-vulkan", "configurePreset": "windows-vulkan", "configuration": "Release", "output": { "outputOnFailure": true } }
     ]
 }

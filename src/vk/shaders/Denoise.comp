@@ -1,0 +1,74 @@
+// CalculatoRTX - débruiteur spatial "à-trous" guidé (backend Vulkan, en l'absence du
+// débruiteur IA OptiX). Une itération du filtre en ondelettes B3 (5x5 taps espacés de
+// 'step' pixels) pondéré par la normale, la profondeur, l'albédo et la luminance.
+// L'éclairement est démodulé par l'albédo pour préserver les textures (bois, carbone,
+// circuit imprimé, légendes).
+//   pc.src  : radiance (1re itération, u1 & 1) ou éclairement démodulé
+//   pc.dst  : éclairement filtré, ou radiance remodulée (dernière itération, u1 & 2)
+//   pc.aux0 : albédo    pc.aux1 : normale (xyz) + profondeur linéaire (w)
+//   pc.u0   : pas (1, 2, 4...)  pc.p0 : exposant normale  pc.p1 : tolérance profondeur
+//   pc.p2   : tolérance luminance (0 = ignorée)  pc.p3 : tolérance albédo
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "Post.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const float kKernel[3] = float[3](3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
+
+vec3 irradiance(PVec4 src, PVec4 alb, uint i, bool demod)
+{
+    const vec3 c = src.v[i].rgb;
+    return demod ? c / max(alb.v[i].rgb, vec3(0.03)) : c;
+}
+
+void main()
+{
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const int w = int(pc.srcW), h = int(pc.srcH);
+    if (p.x >= w || p.y >= h) return;
+    PVec4 src = PVec4(pc.src);
+    PVec4 dst = PVec4(pc.dst);
+    PVec4 alb = PVec4(pc.aux0);
+    PVec4 nrm = PVec4(pc.aux1);
+    const bool demod = (pc.u1 & 1u) != 0u;
+    const bool remod = (pc.u1 & 2u) != 0u;
+    const int step = int(pc.u0);
+
+    const uint ip = uint(p.y * w + p.x);
+    const vec4 nzp = nrm.v[ip];
+    const vec3 np = nzp.xyz;
+    const bool envP = dot(np, np) < 1e-4;
+    const float zp = nzp.w;
+    const vec3 ap = alb.v[ip].rgb;
+    const vec3 cp = irradiance(src, alb, ip, demod);
+    const float lp = luminanceP(cp);
+
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            const ivec2 q = p + ivec2(dx, dy) * step;
+            if (q.x < 0 || q.y < 0 || q.x >= w || q.y >= h) continue;
+            const uint iq = uint(q.y * w + q.x);
+            const vec4 nzq = nrm.v[iq];
+            const bool envQ = dot(nzq.xyz, nzq.xyz) < 1e-4;
+            float wgt = kKernel[abs(dx)] * kKernel[abs(dy)];
+            if (envP || envQ) {
+                if (envP != envQ) continue;  // ne mélange jamais le décor et l'arrière-plan
+            } else {
+                wgt *= pow(max(0.0, dot(np, nzq.xyz)), pc.p0);
+                wgt *= exp(-abs(zp - nzq.w) / (pc.p1 * abs(zp) * float(step) + 1e-3));
+            }
+            const vec3 aq = alb.v[iq].rgb;
+            wgt *= exp(-length(ap - aq) / pc.p3);
+            const vec3 cq = irradiance(src, alb, iq, demod);
+            if (pc.p2 > 0.0) wgt *= exp(-abs(lp - luminanceP(cq)) / (pc.p2 * (lp + luminanceP(cq)) + 1e-3));
+            sum += cq * wgt;
+            wsum += wgt;
+        }
+    }
+    vec3 c = wsum > 1e-8 ? sum / wsum : cp;
+    if (remod) c *= max(ap, vec3(0.03));
+    dst.v[ip] = vec4(c, 1.0);
+}
